@@ -52,3 +52,5 @@ React 19, TypeScript, Vite, Tailwind CSS, Lucide React, MediaRecorder API, Web A
 ## Development checks
 
 Every push to `main` runs TypeScript typechecking and the Vite production build in GitHub Actions.
+
+Deployment source: GitHub `main` branch.
