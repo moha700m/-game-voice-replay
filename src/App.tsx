@@ -5,6 +5,7 @@ import {
   Headphones,
   Mic2,
   Music2,
+  Pause,
   Play,
   Plus,
   Radio,
@@ -21,7 +22,7 @@ type Clip = {
   blob: Blob;
   duration: number;
   createdAt: Date;
-  origin: 'recording' | 'instant';
+  origin: 'recording' | 'instant' | 'trimmed';
 };
 
 type SoundPad = {
@@ -186,6 +187,8 @@ function App() {
   const [instantDuration, setInstantDuration] = useState<30 | 60 | 120>(30);
   const [instantBufferedSeconds, setInstantBufferedSeconds] = useState(0);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
+  const [editorPlaying, setEditorPlaying] = useState(false);
+  const [editorCurrentTime, setEditorCurrentTime] = useState(0);
 
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -201,6 +204,8 @@ function App() {
   const instantTotalSamplesRef = useRef(0);
   const instantSampleRateRef = useRef(48000);
   const instantUiUpdateRef = useRef(0);
+  const waveformRef = useRef<HTMLDivElement | null>(null);
+  const selectionAnchorRef = useRef<number | null>(null);
 
   const resetInstantBuffer = useCallback(() => {
     instantChunksRef.current = [];
@@ -508,6 +513,9 @@ function App() {
   const selectedClip = clips.find(clip => clip.id === selectedClipId) ?? clips[0] ?? null;
 
   const openEditor = useCallback((clip: Clip) => {
+    editorAudioRef.current?.pause();
+    setEditorPlaying(false);
+    setEditorCurrentTime(0);
     setSelectedClipId(clip.id);
     setTrimStart(0);
     setTrimEnd(clip.duration);
@@ -522,6 +530,8 @@ function App() {
     setWaveform([]);
     setDecodedBuffer(null);
     setHighlights([]);
+    setEditorPlaying(false);
+    setEditorCurrentTime(0);
     if (!selectedClip) return;
 
     const decode = async () => {
@@ -533,7 +543,7 @@ function App() {
         if (cancelled) return;
 
         const channel = buffer.getChannelData(0);
-        const bars = 140;
+        const bars = 180;
         const block = Math.max(1, Math.floor(channel.length / bars));
         const peaks = Array.from({ length: bars }, (_, barIndex) => {
           const start = barIndex * block;
@@ -661,18 +671,73 @@ function App() {
     [decodedBuffer]
   );
 
-  const playSelection = useCallback(() => {
-    if (!decodedBuffer) return;
-    playBufferRange(decodedBuffer, trimStart, trimEnd, cleanMode);
-  }, [cleanMode, decodedBuffer, playBufferRange, trimEnd, trimStart]);
-
-  const playFullRecording = useCallback(() => {
+  const toggleEditorPlayback = useCallback(() => {
     const audio = editorAudioRef.current;
-    if (!audio) return;
-    audio.pause();
-    audio.currentTime = 0;
-    void audio.play().catch(() => setError('المتصفح منع التشغيل. اضغط تشغيل مرة ثانية.'));
-  }, []);
+    if (!audio || !selectedClip) return;
+
+    if (!audio.paused) {
+      audio.pause();
+      return;
+    }
+
+    if (
+      audio.currentTime < trimStart ||
+      audio.currentTime >= trimEnd - 0.03
+    ) {
+      audio.currentTime = trimStart;
+      setEditorCurrentTime(trimStart);
+    }
+
+    void audio.play().catch(() =>
+      setError('المتصفح منع التشغيل. اضغط تشغيل مرة ثانية.')
+    );
+  }, [selectedClip, trimEnd, trimStart]);
+
+  const waveformTimeFromClientX = useCallback(
+    (clientX: number) => {
+      const element = waveformRef.current;
+      if (!element || !selectedClip) return 0;
+      const rect = element.getBoundingClientRect();
+      const ratio = Math.max(
+        0,
+        Math.min(1, (clientX - rect.left) / Math.max(1, rect.width))
+      );
+      return ratio * selectedClip.duration;
+    },
+    [selectedClip]
+  );
+
+  const saveTrimmedClip = useCallback(() => {
+    if (!decodedBuffer || !selectedClip || trimEnd <= trimStart) return;
+    const channel = decodedBuffer.getChannelData(0);
+    const from = Math.max(0, Math.floor(trimStart * decodedBuffer.sampleRate));
+    const to = Math.min(
+      channel.length,
+      Math.ceil(trimEnd * decodedBuffer.sampleRate)
+    );
+    const samples = channel.slice(from, to);
+    if (samples.length === 0) return;
+
+    const blob = encodeWav(samples, decodedBuffer.sampleRate);
+    const duration = samples.length / decodedBuffer.sampleRate;
+    const clip: Clip = {
+      id: crypto.randomUUID(),
+      blob,
+      url: URL.createObjectURL(blob),
+      duration,
+      createdAt: new Date(),
+      origin: 'trimmed',
+    };
+
+    editorAudioRef.current?.pause();
+    setEditorPlaying(false);
+    setClips(current => [clip, ...current].slice(0, 30));
+    setSelectedClipId(clip.id);
+    setTrimStart(0);
+    setTrimEnd(duration);
+    setEditorCurrentTime(0);
+    setCleanMode(false);
+  }, [decodedBuffer, selectedClip, trimEnd, trimStart]);
 
   useEffect(() => {
     void refreshDevices();
@@ -950,10 +1015,14 @@ function App() {
                     {index === 0
                       ? clip.origin === 'instant'
                         ? 'آخر Instant Replay'
-                        : 'آخر مقطع'
+                        : clip.origin === 'trimmed'
+                          ? 'آخر قص'
+                          : 'آخر مقطع'
                       : clip.origin === 'instant'
                         ? 'Instant Replay'
-                        : 'مقطع ' + (clips.length - index)}
+                        : clip.origin === 'trimmed'
+                          ? 'قص محفوظ'
+                          : 'مقطع ' + (clips.length - index)}
                   </strong>
                   <span>
                     {clip.createdAt.toLocaleTimeString('ar-SA')} ·{' '}
@@ -991,34 +1060,110 @@ function App() {
         <section id="clip-editor" className="panel editor-panel">
           <div className="editor-head">
             <div>
-              <div className="editor-kicker"><Scissors size={16} /> محرر اللقطة</div>
-              <h2>حدد الجزء اللي تبيه من التسجيل</h2>
-              <p>التسجيل كامل طوله {selectedClip.duration.toFixed(1)} ثانية. حرّك البداية والنهاية ثم شغّل الجزء المحدد فقط.</p>
+              <div className="editor-kicker">
+                <Scissors size={16} /> محرر القص
+              </div>
+              <h2>اسحب على الموجة وحدد الصوت اللي تبيه</h2>
+              <p>
+                الموجة توضح قوة الصوت: الأعمدة الطويلة صوت أعلى، والقصيرة صوت
+                أهدأ. اسحب من البداية للنهاية ثم شغّل أو أوقف الجزء المحدد.
+              </p>
             </div>
-            <div className="selection-time">{trimStart.toFixed(1)}s — {trimEnd.toFixed(1)}s</div>
+            <div className="selection-time">
+              {trimStart.toFixed(1)}s — {trimEnd.toFixed(1)}s
+            </div>
           </div>
 
           <audio
             ref={editorAudioRef}
             src={selectedClip.url}
+            preload="metadata"
+            onPlay={() => setEditorPlaying(true)}
+            onPause={() => setEditorPlaying(false)}
+            onEnded={() => setEditorPlaying(false)}
             onTimeUpdate={event => {
               const audio = event.currentTarget;
+              setEditorCurrentTime(audio.currentTime);
               if (audio.currentTime >= trimEnd && trimEnd > trimStart) {
                 audio.pause();
                 audio.currentTime = trimStart;
+                setEditorCurrentTime(trimStart);
               }
             }}
           />
 
-          <div className="timeline-card">
+          <div className="editor-transport">
+            <button
+              className={editorPlaying ? 'transport-play playing' : 'transport-play'}
+              onClick={toggleEditorPlayback}
+            >
+              {editorPlaying ? (
+                <Pause size={22} fill="currentColor" />
+              ) : (
+                <Play size={22} fill="currentColor" />
+              )}
+              <span>{editorPlaying ? 'إيقاف' : 'تشغيل المحدد'}</span>
+            </button>
+            <div className="transport-readout">
+              <span>المؤشر</span>
+              <strong>{editorCurrentTime.toFixed(1)} ث</strong>
+            </div>
+            <div className="transport-readout">
+              <span>مدة القص</span>
+              <strong>{Math.max(0, trimEnd - trimStart).toFixed(1)} ث</strong>
+            </div>
+          </div>
+
+          <div className="timeline-card trim-timeline">
+            <div className="waveform-guide">
+              <span>صوت هادئ</span>
+              <strong>اسحب على الموجة لتحديد القص</strong>
+              <span>صوت مرتفع</span>
+            </div>
             <div className="timeline-scale">
               <span>0.0</span>
               <span>{(selectedClip.duration / 2).toFixed(1)}</span>
               <span>{selectedClip.duration.toFixed(1)} ثانية</span>
             </div>
-            <div className="waveform" aria-label="شكل موجة الصوت">
+
+            <div
+              ref={waveformRef}
+              className="waveform waveform-editor"
+              aria-label="موجة الصوت وتحديد القص"
+              onPointerDown={event => {
+                event.currentTarget.setPointerCapture(event.pointerId);
+                const time = waveformTimeFromClientX(event.clientX);
+                selectionAnchorRef.current = time;
+                editorAudioRef.current?.pause();
+                if (editorAudioRef.current) editorAudioRef.current.currentTime = time;
+                setEditorCurrentTime(time);
+                setTrimStart(time);
+                setTrimEnd(Math.min(selectedClip.duration, time + 0.08));
+              }}
+              onPointerMove={event => {
+                const anchor = selectionAnchorRef.current;
+                if (anchor === null) return;
+                const time = waveformTimeFromClientX(event.clientX);
+                const start = Math.min(anchor, time);
+                const end = Math.max(anchor, time);
+                setTrimStart(start);
+                setTrimEnd(
+                  Math.min(selectedClip.duration, Math.max(start + 0.08, end))
+                );
+              }}
+              onPointerUp={event => {
+                if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }
+                selectionAnchorRef.current = null;
+              }}
+              onPointerCancel={() => {
+                selectionAnchorRef.current = null;
+              }}
+            >
+              <div className="wave-center-line" />
               {waveform.length === 0 ? (
-                <div className="waveform-loading">جاري تحليل الصوت...</div>
+                <div className="waveform-loading">جاري تحليل موجة الصوت...</div>
               ) : (
                 waveform.map((height, index) => {
                   const time = (index / waveform.length) * selectedClip.duration;
@@ -1027,89 +1172,115 @@ function App() {
                     <span
                       key={index}
                       className={active ? 'wave-bar active' : 'wave-bar'}
-                      style={{ height: Math.max(8, height * 92) + '%' }}
+                      style={{ height: Math.max(5, height * 94) + '%' }}
                     />
                   );
                 })
               )}
+
               <div
-                className="selection-outline"
+                className="selection-region"
                 style={{
-                  right: (trimStart / selectedClip.duration) * 100 + '%',
-                  left: 100 - (trimEnd / selectedClip.duration) * 100 + '%',
+                  left: (trimStart / selectedClip.duration) * 100 + '%',
+                  width:
+                    ((trimEnd - trimStart) / selectedClip.duration) * 100 + '%',
+                }}
+              >
+                <span className="trim-handle trim-handle-start">
+                  {trimStart.toFixed(1)}
+                </span>
+                <span className="trim-handle trim-handle-end">
+                  {trimEnd.toFixed(1)}
+                </span>
+              </div>
+
+              <div
+                className="playhead"
+                style={{
+                  left:
+                    (Math.min(editorCurrentTime, selectedClip.duration) /
+                      selectedClip.duration) *
+                      100 +
+                    '%',
                 }}
               />
             </div>
 
-            <div className="range-block">
+            <div className="precision-grid">
               <label>
-                <span>بداية اللقطة</span>
+                <span>بداية القص</span>
                 <strong>{trimStart.toFixed(1)} ث</strong>
+                <input
+                  aria-label="بداية القص"
+                  type="range"
+                  min="0"
+                  max={Math.max(0, selectedClip.duration - 0.1)}
+                  step="0.05"
+                  value={Math.min(
+                    trimStart,
+                    Math.max(0, selectedClip.duration - 0.1)
+                  )}
+                  onChange={event => {
+                    const next = Number(event.target.value);
+                    const value = Math.min(next, Math.max(0, trimEnd - 0.08));
+                    setTrimStart(value);
+                    if (editorAudioRef.current) {
+                      editorAudioRef.current.currentTime = value;
+                    }
+                    setEditorCurrentTime(value);
+                  }}
+                />
               </label>
-              <input
-                aria-label="بداية اللقطة"
-                type="range"
-                min="0"
-                max={Math.max(0, selectedClip.duration - 0.1)}
-                step="0.1"
-                value={Math.min(trimStart, Math.max(0, selectedClip.duration - 0.1))}
-                onChange={event => {
-                  const next = Number(event.target.value);
-                  setTrimStart(Math.min(next, Math.max(0, trimEnd - 0.1)));
-                }}
-              />
-            </div>
 
-            <div className="range-block">
               <label>
-                <span>نهاية اللقطة</span>
+                <span>نهاية القص</span>
                 <strong>{trimEnd.toFixed(1)} ث</strong>
+                <input
+                  aria-label="نهاية القص"
+                  type="range"
+                  min="0.08"
+                  max={selectedClip.duration}
+                  step="0.05"
+                  value={trimEnd}
+                  onChange={event => {
+                    const next = Number(event.target.value);
+                    setTrimEnd(Math.max(next, trimStart + 0.08));
+                  }}
+                />
               </label>
-              <input
-                aria-label="نهاية اللقطة"
-                type="range"
-                min="0.1"
-                max={selectedClip.duration}
-                step="0.1"
-                value={trimEnd}
-                onChange={event => {
-                  const next = Number(event.target.value);
-                  setTrimEnd(Math.max(next, trimStart + 0.1));
-                }}
-              />
             </div>
           </div>
 
-          <div className="clean-row">
-            <button className={cleanMode ? 'clean-button active' : 'clean-button'} onClick={autoCleanSelection}>
-              <Sparkles size={17} />
-              {cleanMode ? 'التنظيف مفعّل' : 'نظّف اللقطة تلقائيًا'}
-            </button>
-            <span>يقص الصمت من الأطراف ويطبّق Normalize + Limiter وقت التشغيل.</span>
-          </div>
-
-          <div className="editor-actions">
-            <button className="editor-primary" onClick={playSelection}>
-              <Play size={18} fill="currentColor" />
-              تشغيل الجزء المحدد فقط
-            </button>
-            <button className="ghost" onClick={playFullRecording}>
-              <RotateCcw size={17} />
-              تشغيل التسجيل كامل
+          <div className="editor-actions editor-cut-actions">
+            <button
+              className="editor-primary cut-save"
+              onClick={saveTrimmedClip}
+              disabled={!decodedBuffer || trimEnd <= trimStart}
+            >
+              <Scissors size={18} />
+              قص وحفظ كمقطع جديد
             </button>
             <button
               className="ghost"
               onClick={() => {
+                editorAudioRef.current?.pause();
+                if (editorAudioRef.current) editorAudioRef.current.currentTime = 0;
+                setEditorCurrentTime(0);
                 setTrimStart(0);
                 setTrimEnd(selectedClip.duration);
                 setCleanMode(false);
               }}
             >
-              إعادة التحديد كامل
+              <RotateCcw size={17} />
+              تحديد التسجيل كامل
             </button>
-            <button className="soundboard-add" onClick={addToSoundboard} disabled={!decodedBuffer}>
+            <button
+              className="soundboard-add"
+              onClick={addToSoundboard}
+              disabled={!decodedBuffer}
+            >
               <Plus size={17} />
-              أضف الجزء إلى Soundboard
+              أضف المحدد إلى Soundboard
             </button>
           </div>
         </section>
