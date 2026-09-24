@@ -1997,4 +1997,332 @@ function App() {
                 const time = waveformTimeFromClientX(event.clientX);
                 selectionAnchorRef.current = time;
                 editorAudioRef.current?.pause();
-                if (editorAudioRef.current) editorAudioRef.current.currentTime = time;
+                if (editorAudioRef.current) editorAudioRef.current.currentTime = time;                setEditorCurrentTime(time);
+                setTrimStart(time);
+                setTrimEnd(Math.min(selectedClip.duration, time + 0.08));
+              }}
+              onPointerMove={event => {
+                const anchor = selectionAnchorRef.current;
+                if (anchor === null) return;
+                const time = waveformTimeFromClientX(event.clientX);
+                const start = Math.min(anchor, time);
+                const end = Math.max(anchor, time);
+                setTrimStart(start);
+                setTrimEnd(
+                  Math.min(selectedClip.duration, Math.max(start + 0.08, end))
+                );
+              }}
+              onPointerUp={event => {
+                if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }
+                selectionAnchorRef.current = null;
+              }}
+              onPointerCancel={() => {
+                selectionAnchorRef.current = null;
+              }}
+            >
+              <div className="wave-center-line" />
+              {waveform.length === 0 ? (
+                <div className="waveform-loading">جاري تحليل موجة الصوت...</div>
+              ) : (
+                waveform.map((height, index) => {
+                  const time = (index / waveform.length) * selectedClip.duration;
+                  const active = time >= trimStart && time <= trimEnd;
+                  return (
+                    <span
+                      key={index}
+                      className={active ? 'wave-bar active' : 'wave-bar'}
+                      style={{ height: Math.max(5, height * 94) + '%' }}
+                    />
+                  );
+                })
+              )}
+
+              <div
+                className="selection-region"
+                style={{
+                  left: (trimStart / selectedClip.duration) * 100 + '%',
+                  width:
+                    ((trimEnd - trimStart) / selectedClip.duration) * 100 + '%',
+                }}
+              >
+                <span className="trim-handle trim-handle-start">
+                  {trimStart.toFixed(1)}
+                </span>
+                <span className="trim-handle trim-handle-end">
+                  {trimEnd.toFixed(1)}
+                </span>
+              </div>
+
+              <div
+                className="playhead"
+                style={{
+                  left:
+                    (Math.min(editorCurrentTime, selectedClip.duration) /
+                      selectedClip.duration) *
+                      100 +
+                    '%',
+                }}
+              />
+            </div>
+
+            <div className="precision-grid">
+              <label>
+                <span>بداية القص</span>
+                <strong>{trimStart.toFixed(1)} ث</strong>
+                <input
+                  aria-label="بداية القص"
+                  type="range"
+                  min="0"
+                  max={Math.max(0, selectedClip.duration - 0.1)}
+                  step="0.05"
+                  value={Math.min(
+                    trimStart,
+                    Math.max(0, selectedClip.duration - 0.1)
+                  )}
+                  onChange={event => {
+                    const next = Number(event.target.value);
+                    const value = Math.min(next, Math.max(0, trimEnd - 0.08));
+                    setTrimStart(value);
+                    if (editorAudioRef.current) {
+                      editorAudioRef.current.currentTime = value;
+                    }
+                    setEditorCurrentTime(value);
+                  }}
+                />
+              </label>
+
+              <label>
+                <span>نهاية القص</span>
+                <strong>{trimEnd.toFixed(1)} ث</strong>
+                <input
+                  aria-label="نهاية القص"
+                  type="range"
+                  min="0.08"
+                  max={selectedClip.duration}
+                  step="0.05"
+                  value={trimEnd}
+                  onChange={event => {
+                    const next = Number(event.target.value);
+                    setTrimEnd(Math.max(next, trimStart + 0.08));
+                  }}
+                />
+              </label>
+            </div>
+          </div>
+
+          {saveNotice && <div className="save-notice">{saveNotice}</div>}
+
+          <div className="editor-actions editor-cut-actions">
+            <button
+              className="editor-primary cut-save"
+              onClick={() => void saveTrimmedClip()}
+              disabled={!decodedBuffer || trimEnd <= trimStart}
+            >
+              <Scissors size={18} />
+              حفظ التعديل في لقطاتي
+            </button>
+            <button
+              className="ghost"
+              onClick={() => void downloadProcessedSelection()}
+              disabled={!decodedBuffer || trimEnd <= trimStart}
+            >
+              <Download size={17} />
+              تنزيل التعديل
+            </button>
+            <button
+              className="ghost"
+              onClick={() => {
+                editorAudioRef.current?.pause();
+                if (editorAudioRef.current) editorAudioRef.current.currentTime = 0;
+                setEditorCurrentTime(0);
+                setTrimStart(0);
+                setTrimEnd(selectedClip.duration);
+                setCleanMode(false);
+                setEditorBoostDb(0);
+                applyEffectsPreset('reset');
+              }}
+            >
+              <RotateCcw size={17} />
+              تحديد التسجيل كامل
+            </button>
+            <button
+              className="soundboard-add"
+              onClick={() => void addToSoundboard()}
+              disabled={!decodedBuffer}
+            >
+              <Plus size={17} />
+              أضف المحدد إلى Soundboard
+            </button>
+          </div>
+        </section>
+      )}
+
+      {selectedClip && (
+        <section className="panel highlights-panel">
+          <div className="soundboard-head">
+            <div>
+              <div className="editor-kicker"><Sparkles size={16} /> SMART HIGHLIGHTS</div>
+              <h2>اللحظات المقترحة</h2>
+              <p>تحليل محلي للشدة والـPeaks والتغيّر المفاجئ. الصوت ما يطلع من جهازك.</p>
+            </div>
+            <span>{highlights.length} اقتراحات</span>
+          </div>
+
+          {!decodedBuffer ? (
+            <div className="highlights-empty">جاري تحليل المقطع...</div>
+          ) : highlights.length === 0 ? (
+            <div className="highlights-empty">
+              ما لقيت ذروة واضحة في هذا المقطع. جرّب تسجيل أطول أو فيه كلام أكثر.
+            </div>
+          ) : (
+            <div className="highlights-grid">
+              {highlights.map(highlight => (
+                <article className="highlight-card" key={highlight.id}>
+                  <div className="highlight-top">
+                    <div>
+                      <strong>{highlight.label}</strong>
+                      <span>{highlight.detail}</span>
+                    </div>
+                    <b>{highlight.score}%</b>
+                  </div>
+                  <div className="highlight-time">
+                    {highlight.start.toFixed(1)}s — {highlight.end.toFixed(1)}s
+                  </div>
+                  <div className="highlight-actions">
+                    <button
+                      onClick={() =>
+                        decodedBuffer &&
+                        playBufferRange(
+                          decodedBuffer,
+                          highlight.start,
+                          highlight.end,
+                          true
+                        )
+                      }
+                    >
+                      <Play size={15} fill="currentColor" /> تشغيل
+                    </button>
+                    <button
+                      onClick={() => {
+                        setTrimStart(highlight.start);
+                        setTrimEnd(highlight.end);
+                        setCleanMode(true);
+                        document.getElementById('clip-editor')?.scrollIntoView({
+                          behavior: 'smooth',
+                          block: 'center',
+                        });
+                      }}
+                    >
+                      <Scissors size={15} /> افتح بالمحرر
+                    </button>
+                    <button onClick={() => addHighlightToSoundboard(highlight)}>
+                      <Plus size={15} /> Soundboard
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {(soundPadsLoaded || soundPads.length > 0) && (
+        <section className="panel soundboard-panel">
+          <div className="soundboard-head">
+            <div>
+              <div className="editor-kicker"><Music2 size={16} /> SOUNDBOARD</div>
+              <h2>لوحة الأصوات</h2>
+              <p>
+                كل زر محفوظ تلقائيًا على هذا الجهاز ويرجع بعد إغلاق Chrome.
+              </p>
+            </div>
+            <span>{soundPads.length} أصوات</span>
+          </div>
+          {!soundPadsLoaded ? (
+            <div className="highlights-empty">جاري تحميل Soundboard المحفوظ...</div>
+          ) : soundPads.length === 0 ? (
+            <div className="highlights-empty">
+              ما أضفت أصوات للـSoundboard للحين.
+            </div>
+          ) : (
+          <div className="soundboard-grid">
+            {soundPads.map((pad, index) => (
+              <div className="sound-pad" key={pad.id}>
+                <button
+                  onClick={() =>
+                    playBufferRange(
+                      pad.buffer,
+                      pad.start,
+                      pad.end,
+                      pad.enhanced,
+                      pad.boostDb
+                    )
+                  }
+                >
+                  <Play size={20} fill="currentColor" />
+                  <strong>{pad.name}</strong>
+                  <small>
+                    {(pad.end - pad.start).toFixed(1)} ث
+                    {pad.enhanced ? ' · منظّف' : ''}
+                    {pad.boostDb > 0 ? ' · +' + pad.boostDb + ' dB' : ''}
+                  </small>
+                </button>
+                <div className="pad-footer">
+                  <input
+                    aria-label={'اسم زر الصوت ' + (index + 1)}
+                    value={pad.name}
+                    onChange={event => {
+                      const name = event.target.value;
+                      setSoundPads(current =>
+                        current.map(item => {
+                          if (item.id !== pad.id) return item;
+                          const updated = { ...item, name };
+                          void persistSoundPad(updated).catch(() =>
+                            setError('تعذر حفظ اسم صوت Soundboard.')
+                          );
+                          return updated;
+                        })
+                      );
+                    }}
+                  />
+                  <button
+                    className="pad-delete"
+                    aria-label="حذف زر الصوت"
+                    onClick={() => {
+                      setSoundPads(current =>
+                        current.filter(item => item.id !== pad.id)
+                      );
+                      void deleteStoredSoundPad(pad.id).catch(() =>
+                        setError('تعذر حذف صوت Soundboard المحفوظ.')
+                      );
+                    }}
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+          )}
+        </section>
+      )}
+
+      <footer>
+        <span>
+          Local-first · لقطاتك وSoundboard محفوظة على هذا الجهاز ولا تُرفع تلقائيًا
+        </span>
+        <span>أفضل نتيجة: Chrome/Edge + VB-CABLE</span>
+      </footer>
+    </main>
+  );
+}
+
+declare global {
+  interface Window {
+    webkitAudioContext: typeof AudioContext;
+  }
+}
+
+export default App;
