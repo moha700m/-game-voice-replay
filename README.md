@@ -38,9 +38,9 @@ npm run build
 npm run preview
 ```
 
-## Live version
+## Deployment
 
-https://game-voice-replay-m7vxvu.v2.appdeploy.ai/
+Configured for Vercel. Import this GitHub repository into Vercel and deploy the `main` branch. Future pushes to `main` will deploy automatically once Git integration is connected.
 
 ## Stack
 
