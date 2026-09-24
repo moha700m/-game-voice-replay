@@ -901,44 +901,6 @@ function App() {
     source.start(0, Math.max(0, start), Math.max(0.05, end - start));
   }, []);
 
-  const autoCleanSelection = useCallback(() => {
-    if (!decodedBuffer) return;
-    const channel = decodedBuffer.getChannelData(0);
-    const sampleRate = decodedBuffer.sampleRate;
-    const windowSize = Math.max(1, Math.floor(sampleRate * 0.012));
-    const threshold = 0.025;
-    let first = 0;
-    let last = channel.length - 1;
-    let found = false;
-
-    for (let i = 0; i < channel.length; i += windowSize) {
-      let peak = 0;
-      const end = Math.min(channel.length, i + windowSize);
-      for (let j = i; j < end; j += 1) peak = Math.max(peak, Math.abs(channel[j]));
-      if (peak >= threshold) {
-        first = i;
-        found = true;
-        break;
-      }
-    }
-
-    if (found) {
-      for (let i = channel.length - windowSize; i >= 0; i -= windowSize) {
-        let peak = 0;
-        const end = Math.min(channel.length, i + windowSize);
-        for (let j = Math.max(0, i); j < end; j += 1) peak = Math.max(peak, Math.abs(channel[j]));
-        if (peak >= threshold) {
-          last = end;
-          break;
-        }
-      }
-      const padding = 0.05;
-      setTrimStart(Math.max(0, first / sampleRate - padding));
-      setTrimEnd(Math.min(decodedBuffer.duration, last / sampleRate + padding));
-    }
-    setCleanMode(true);
-  }, [decodedBuffer]);
-
   const addToSoundboard = useCallback(() => {
     if (!decodedBuffer || !selectedClip || trimEnd <= trimStart) return;
     const channel = decodedBuffer.getChannelData(0);
