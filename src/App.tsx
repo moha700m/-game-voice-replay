@@ -225,20 +225,6 @@ async function persistSoundPad(pad: SoundPad) {
   }
 }
 
-async function deleteStoredSoundPad(id: string) {
-  const db = await openClipDb();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const transaction = db.transaction(SOUND_PAD_STORE_NAME, 'readwrite');
-      transaction.objectStore(SOUND_PAD_STORE_NAME).delete(id);
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error);
-    });
-  } finally {
-    db.close();
-  }
-}
-
 function encodeWav(samples: Float32Array, sampleRate: number) {
   const bytesPerSample = 2;
   const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample);
@@ -1805,7 +1791,7 @@ function App() {
               <div className="editor-kicker"><Music2 size={16} /> SOUNDBOARD</div>
               <h2>لوحة الأصوات</h2>
               <p>
-                كل زر محفوظ تلقائيًا على هذا الجهاز ويرجع بعد إغلاق Chrome.
+                كل زر محفوظ تلقائيًا ومحمي من الحذف، ويرجع بعد إغلاق Chrome.
               </p>
             </div>
             <span>{soundPads.length} أصوات</span>
@@ -1857,20 +1843,6 @@ function App() {
                       );
                     }}
                   />
-                  <button
-                    className="pad-delete"
-                    aria-label="حذف زر الصوت"
-                    onClick={() => {
-                      setSoundPads(current =>
-                        current.filter(item => item.id !== pad.id)
-                      );
-                      void deleteStoredSoundPad(pad.id).catch(() =>
-                        setError('تعذر حذف صوت Soundboard المحفوظ.')
-                      );
-                    }}
-                  >
-                    <Trash2 size={15} />
-                  </button>
                 </div>
               </div>
             ))}
