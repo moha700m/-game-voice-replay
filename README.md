@@ -6,6 +6,8 @@ Local-first web app for capturing game voice chat, trimming precise moments, cle
 
 - Selectable audio input such as VB-CABLE
 - Record / stop / replay workflow
+- Instant Replay circular PCM buffer for the last 30 / 60 / 120 seconds
+- Local Smart Highlights detection using audio peaks and dynamics
 - Recent clips list
 - Precision in/out trimming
 - Real waveform visualization
@@ -21,6 +23,7 @@ Local-first web app for capturing game voice chat, trimming precise moments, cle
 - `Ctrl + Shift + 1` — start/stop recording
 - `Ctrl + Shift + 2` — replay latest clip
 - `Ctrl + Shift + 3` — download latest clip
+- `Ctrl + Shift + 4` — save the current Instant Replay window
 
 Shortcuts work while the web page is the active window.
 
