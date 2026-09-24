@@ -68,47 +68,7 @@ type StoredSoundPad = {
 const CLIP_DB_NAME = 'game-voice-replay';
 const CLIP_STORE_NAME = 'clips';
 const SOUND_PAD_STORE_NAME = 'soundPads';
-const SETTINGS_KEY = 'game-voice-replay-settings-v1';
 const MAX_SAVED_CLIPS = 30;
-
-type StoredSettings = {
-  selectedDeviceId?: string;
-  instantDuration?: 30 | 60 | 120;
-};
-
-function loadStoredSettings(): StoredSettings {
-  try {
-    const raw = window.localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as StoredSettings;
-    return {
-      selectedDeviceId:
-        typeof parsed.selectedDeviceId === 'string'
-          ? parsed.selectedDeviceId
-          : undefined,
-      instantDuration:
-        parsed.instantDuration === 30 ||
-        parsed.instantDuration === 60 ||
-        parsed.instantDuration === 120
-          ? parsed.instantDuration
-          : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
-function persistStoredSettings(next: Partial<StoredSettings>) {
-  try {
-    const current = loadStoredSettings();
-    window.localStorage.setItem(
-      SETTINGS_KEY,
-      JSON.stringify({ ...current, ...next })
-    );
-  } catch {
-    // Storage may be unavailable in private or restricted browser contexts.
-  }
-}
 
 function openClipDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -428,9 +388,7 @@ function detectHighlights(buffer: AudioBuffer): Highlight[] {
 
 function App() {
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState(
-    () => loadStoredSettings().selectedDeviceId ?? ''
-  );
+  const [selectedDeviceId, setSelectedDeviceId] = useState('');
   const [captureState, setCaptureState] = useState<CaptureState>('idle');
   const [error, setError] = useState('');
   const [recording, setRecording] = useState(false);
@@ -446,9 +404,7 @@ function App() {
   const [soundPads, setSoundPads] = useState<SoundPad[]>([]);
   const [soundPadsLoaded, setSoundPadsLoaded] = useState(false);
   const [instantEnabled, setInstantEnabled] = useState(false);
-  const [instantDuration, setInstantDuration] = useState<30 | 60 | 120>(
-    () => loadStoredSettings().instantDuration ?? 30
-  );
+  const [instantDuration, setInstantDuration] = useState<30 | 60 | 120>(30);
   const [instantBufferedSeconds, setInstantBufferedSeconds] = useState(0);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [editorPlaying, setEditorPlaying] = useState(false);
@@ -1236,11 +1192,7 @@ function App() {
           <select
             aria-label="مصدر الصوت"
             value={selectedDeviceId}
-            onChange={event => {
-              const nextDeviceId = event.target.value;
-              setSelectedDeviceId(nextDeviceId);
-              persistStoredSettings({ selectedDeviceId: nextDeviceId });
-            }}
+            onChange={event => setSelectedDeviceId(event.target.value)}
           >
             <option value="">اختيار تلقائي</option>
             {devices.map((device, index) => (
@@ -1298,10 +1250,7 @@ function App() {
               <button
                 key={seconds}
                 className={instantDuration === seconds ? 'active' : ''}
-                onClick={() => {
-                  setInstantDuration(seconds);
-                  persistStoredSettings({ instantDuration: seconds });
-                }}
+                onClick={() => setInstantDuration(seconds)}
               >
                 {seconds}ث
               </button>
@@ -1512,28 +1461,6 @@ function App() {
             }}
           />
 
-          <div className="editor-transport">
-            <button
-              className={editorPlaying ? 'transport-play playing' : 'transport-play'}
-              onClick={toggleEditorPlayback}
-            >
-              {editorPlaying ? (
-                <Pause size={22} fill="currentColor" />
-              ) : (
-                <Play size={22} fill="currentColor" />
-              )}
-              <span>{editorPlaying ? 'إيقاف' : 'تشغيل المحدد'}</span>
-            </button>
-            <div className="transport-readout">
-              <span>المؤشر</span>
-              <strong>{editorCurrentTime.toFixed(1)} ث</strong>
-            </div>
-            <div className="transport-readout">
-              <span>مدة القص</span>
-              <strong>{Math.max(0, trimEnd - trimStart).toFixed(1)} ث</strong>
-            </div>
-          </div>
-
           <div className="boost-panel">
             <div className="boost-head">
               <div className="boost-title">
@@ -1705,6 +1632,28 @@ function App() {
                   }}
                 />
               </label>
+            </div>
+          </div>
+
+          <div className="editor-transport editor-transport-near-save">
+            <button
+              className={editorPlaying ? 'transport-play playing' : 'transport-play'}
+              onClick={toggleEditorPlayback}
+            >
+              {editorPlaying ? (
+                <Pause size={22} fill="currentColor" />
+              ) : (
+                <Play size={22} fill="currentColor" />
+              )}
+              <span>{editorPlaying ? 'إيقاف' : 'تشغيل المحدد'}</span>
+            </button>
+            <div className="transport-readout">
+              <span>المؤشر</span>
+              <strong>{editorCurrentTime.toFixed(1)} ث</strong>
+            </div>
+            <div className="transport-readout">
+              <span>مدة القص</span>
+              <strong>{Math.max(0, trimEnd - trimStart).toFixed(1)} ث</strong>
             </div>
           </div>
 
