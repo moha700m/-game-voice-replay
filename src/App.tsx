@@ -295,6 +295,86 @@ function applyBoost(samples: Float32Array, gainDb: number) {
   return output;
 }
 
+function makeDistortionCurve(amount: number) {
+  const curve = new Float32Array(2048);
+  const drive = Math.max(0, amount) * 2.4;
+  for (let index = 0; index < curve.length; index += 1) {
+    const x = (index * 2) / (curve.length - 1) - 1;
+    curve[index] =
+      drive === 0 ? x : ((1 + drive) * x) / (1 + drive * Math.abs(x));
+  }
+  return curve;
+}
+
+function createImpulseResponse(
+  context: BaseAudioContext,
+  seconds = 1.5,
+  decay = 2.7
+) {
+  const length = Math.max(1, Math.floor(context.sampleRate * seconds));
+  const impulse = context.createBuffer(2, length, context.sampleRate);
+  let seed = 1337;
+  const noise = () => {
+    seed = (seed * 16807) % 2147483647;
+    return (seed / 2147483647) * 2 - 1;
+  };
+  for (let channel = 0; channel < impulse.numberOfChannels; channel += 1) {
+    const data = impulse.getChannelData(channel);
+    for (let index = 0; index < length; index += 1) {
+      data[index] = noise() * Math.pow(1 - index / length, decay);
+    }
+  }
+  return impulse;
+}
+
+function encodeAudioBufferWav(buffer: AudioBuffer) {
+  const channels = Math.min(2, Math.max(1, buffer.numberOfChannels));
+  const bytesPerSample = 2;
+  const frameCount = buffer.length;
+  const raw = new ArrayBuffer(44 + frameCount * channels * bytesPerSample);
+  const view = new DataView(raw);
+  const writeText = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  };
+
+  writeText(0, 'RIFF');
+  view.setUint32(4, 36 + frameCount * channels * bytesPerSample, true);
+  writeText(8, 'WAVE');
+  writeText(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, buffer.sampleRate, true);
+  view.setUint32(
+    28,
+    buffer.sampleRate * channels * bytesPerSample,
+    true
+  );
+  view.setUint16(32, channels * bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeText(36, 'data');
+  view.setUint32(40, frameCount * channels * bytesPerSample, true);
+
+  const channelData = Array.from({ length: channels }, (_, channel) =>
+    buffer.getChannelData(Math.min(channel, buffer.numberOfChannels - 1))
+  );
+  let offset = 44;
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    for (let channel = 0; channel < channels; channel += 1) {
+      const sample = Math.max(-1, Math.min(1, channelData[channel][frame]));
+      view.setInt16(
+        offset,
+        sample < 0 ? sample * 0x8000 : sample * 0x7fff,
+        true
+      );
+      offset += bytesPerSample;
+    }
+  }
+  return new Blob([raw], { type: 'audio/wav' });
+}
+
 function detectHighlights(buffer: AudioBuffer): Highlight[] {
   const channel = buffer.getChannelData(0);
   const sampleRate = buffer.sampleRate;
@@ -412,6 +492,14 @@ function App() {
   const [clipsLoaded, setClipsLoaded] = useState(false);
   const [saveNotice, setSaveNotice] = useState('');
   const [editorBoostDb, setEditorBoostDb] = useState(0);
+  const [fxLowDb, setFxLowDb] = useState(0);
+  const [fxMidDb, setFxMidDb] = useState(0);
+  const [fxHighDb, setFxHighDb] = useState(0);
+  const [fxCompressor, setFxCompressor] = useState(0);
+  const [fxReverb, setFxReverb] = useState(0);
+  const [fxDelay, setFxDelay] = useState(0);
+  const [fxDistortion, setFxDistortion] = useState(0);
+  const [fxPan, setFxPan] = useState(0);
 
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -433,6 +521,15 @@ function App() {
   const editorMediaSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
   const editorMediaElementRef = useRef<HTMLAudioElement | null>(null);
   const editorGainNodeRef = useRef<GainNode | null>(null);
+  const editorLowNodeRef = useRef<BiquadFilterNode | null>(null);
+  const editorMidNodeRef = useRef<BiquadFilterNode | null>(null);
+  const editorHighNodeRef = useRef<BiquadFilterNode | null>(null);
+  const editorCompressorNodeRef =
+    useRef<DynamicsCompressorNode | null>(null);
+  const editorDistortionNodeRef = useRef<WaveShaperNode | null>(null);
+  const editorPanNodeRef = useRef<StereoPannerNode | null>(null);
+  const editorDelayWetRef = useRef<GainNode | null>(null);
+  const editorReverbWetRef = useRef<GainNode | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -808,6 +905,14 @@ function App() {
     setEditorPlaying(false);
     setEditorCurrentTime(0);
     setEditorBoostDb(0);
+    setFxLowDb(0);
+    setFxMidDb(0);
+    setFxHighDb(0);
+    setFxCompressor(0);
+    setFxReverb(0);
+    setFxDelay(0);
+    setFxDistortion(0);
+    setFxPan(0);
     setSelectedClipId(clip.id);
     setTrimStart(0);
     setTrimEnd(clip.duration);
@@ -825,6 +930,14 @@ function App() {
     setEditorPlaying(false);
     setEditorCurrentTime(0);
     setEditorBoostDb(0);
+    setFxLowDb(0);
+    setFxMidDb(0);
+    setFxHighDb(0);
+    setFxCompressor(0);
+    setFxReverb(0);
+    setFxDelay(0);
+    setFxDistortion(0);
+    setFxPan(0);
     if (!selectedClip) return;
 
     const decode = async () => {
@@ -901,26 +1014,206 @@ function App() {
     source.start(0, Math.max(0, start), Math.max(0.05, end - start));
   }, []);
 
-  const addToSoundboard = useCallback(() => {
-    if (!decodedBuffer || !selectedClip || trimEnd <= trimStart) return;
-    const channel = decodedBuffer.getChannelData(0);
-    const from = Math.max(0, Math.floor(trimStart * decodedBuffer.sampleRate));
-    const to = Math.min(
-      channel.length,
-      Math.ceil(trimEnd * decodedBuffer.sampleRate)
+  const applyEffectsPreset = useCallback(
+    (preset: 'reset' | 'clear' | 'radio' | 'bass' | 'hall') => {
+      if (preset === 'clear') {
+        setFxLowDb(-2);
+        setFxMidDb(3);
+        setFxHighDb(4);
+        setFxCompressor(45);
+        setFxReverb(0);
+        setFxDelay(0);
+        setFxDistortion(0);
+        setFxPan(0);
+      } else if (preset === 'radio') {
+        setFxLowDb(-10);
+        setFxMidDb(8);
+        setFxHighDb(-8);
+        setFxCompressor(70);
+        setFxReverb(3);
+        setFxDelay(0);
+        setFxDistortion(16);
+        setFxPan(0);
+      } else if (preset === 'bass') {
+        setFxLowDb(9);
+        setFxMidDb(1);
+        setFxHighDb(-4);
+        setFxCompressor(38);
+        setFxReverb(0);
+        setFxDelay(0);
+        setFxDistortion(4);
+        setFxPan(0);
+      } else if (preset === 'hall') {
+        setFxLowDb(1);
+        setFxMidDb(0);
+        setFxHighDb(2);
+        setFxCompressor(28);
+        setFxReverb(52);
+        setFxDelay(18);
+        setFxDistortion(0);
+        setFxPan(0);
+      } else {
+        setFxLowDb(0);
+        setFxMidDb(0);
+        setFxHighDb(0);
+        setFxCompressor(0);
+        setFxReverb(0);
+        setFxDelay(0);
+        setFxDistortion(0);
+        setFxPan(0);
+      }
+    },
+    []
+  );
+
+  const renderProcessedSelection = useCallback(async () => {
+    if (!decodedBuffer || trimEnd <= trimStart) return null;
+    const start = Math.max(0, Math.min(trimStart, decodedBuffer.duration));
+    const end = Math.max(
+      start + 0.03,
+      Math.min(trimEnd, decodedBuffer.duration)
     );
-    const blob = encodeWav(channel.slice(from, to), decodedBuffer.sampleRate);
+    const duration = end - start;
+    const tail =
+      fxReverb > 0 || fxDelay > 0
+        ? Math.max((fxReverb / 100) * 1.4, (fxDelay / 100) * 0.7)
+        : 0;
+    const offline = new OfflineAudioContext(
+      2,
+      Math.max(
+        1,
+        Math.ceil((duration + tail) * decodedBuffer.sampleRate)
+      ),
+      decodedBuffer.sampleRate
+    );
+    const source = offline.createBufferSource();
+    source.buffer = decodedBuffer;
+
+    const low = offline.createBiquadFilter();
+    low.type = 'lowshelf';
+    low.frequency.value = 180;
+    low.gain.value = fxLowDb;
+
+    const mid = offline.createBiquadFilter();
+    mid.type = 'peaking';
+    mid.frequency.value = 1300;
+    mid.Q.value = 0.8;
+    mid.gain.value = fxMidDb;
+
+    const high = offline.createBiquadFilter();
+    high.type = 'highshelf';
+    high.frequency.value = 5200;
+    high.gain.value = fxHighDb;
+
+    const compressor = offline.createDynamicsCompressor();
+    compressor.threshold.value =
+      fxCompressor === 0 ? 0 : -12 - (fxCompressor / 100) * 22;
+    compressor.knee.value = 8;
+    compressor.ratio.value =
+      fxCompressor === 0 ? 1 : 2 + (fxCompressor / 100) * 10;
+    compressor.attack.value = 0.004;
+    compressor.release.value = 0.16;
+
+    const shaper = offline.createWaveShaper();
+    shaper.curve = makeDistortionCurve(fxDistortion / 18);
+    shaper.oversample = '4x';
+
+    const pan = offline.createStereoPanner();
+    pan.pan.value = fxPan / 100;
+
+    const gain = offline.createGain();
+    let normalizeGain = 1;
+    if (cleanMode) {
+      const channel = decodedBuffer.getChannelData(0);
+      const from = Math.floor(start * decodedBuffer.sampleRate);
+      const to = Math.min(
+        channel.length,
+        Math.ceil(end * decodedBuffer.sampleRate)
+      );
+      let peak = 0;
+      for (let index = from; index < to; index += 32) {
+        peak = Math.max(peak, Math.abs(channel[index]));
+      }
+      normalizeGain = peak > 0 ? Math.min(3, 0.9 / peak) : 1;
+    }
+    gain.gain.value = normalizeGain * gainFromDb(editorBoostDb);
+
+    const limiter = offline.createDynamicsCompressor();
+    limiter.threshold.value = -3;
+    limiter.knee.value = 5;
+    limiter.ratio.value = 16;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.12;
+
+    source
+      .connect(low)
+      .connect(mid)
+      .connect(high)
+      .connect(compressor)
+      .connect(shaper)
+      .connect(pan)
+      .connect(gain)
+      .connect(limiter);
+
+    limiter.connect(offline.destination);
+
+    if (fxDelay > 0) {
+      const delay = offline.createDelay(1);
+      delay.delayTime.value = 0.19;
+      const feedback = offline.createGain();
+      feedback.gain.value = 0.28;
+      const wet = offline.createGain();
+      wet.gain.value = (fxDelay / 100) * 0.55;
+      limiter.connect(delay);
+      delay.connect(feedback).connect(delay);
+      delay.connect(wet).connect(offline.destination);
+    }
+
+    if (fxReverb > 0) {
+      const convolver = offline.createConvolver();
+      convolver.buffer = createImpulseResponse(offline, 1.7, 2.8);
+      const wet = offline.createGain();
+      wet.gain.value = (fxReverb / 100) * 0.65;
+      limiter
+        .connect(convolver)
+        .connect(wet)
+        .connect(offline.destination);
+    }
+
+    source.start(0, start, duration);
+    return offline.startRendering();
+  }, [
+    cleanMode,
+    decodedBuffer,
+    editorBoostDb,
+    fxCompressor,
+    fxDelay,
+    fxDistortion,
+    fxHighDb,
+    fxLowDb,
+    fxMidDb,
+    fxPan,
+    fxReverb,
+    trimEnd,
+    trimStart,
+  ]);
+
+  const addToSoundboard = useCallback(async () => {
+    if (!decodedBuffer || !selectedClip || trimEnd <= trimStart) return;
+    const rendered = await renderProcessedSelection();
+    if (!rendered) return;
+    const blob = encodeAudioBufferWav(rendered);
 
     setSoundPads(current => {
       const pad: SoundPad = {
         id: crypto.randomUUID(),
         name: 'لقطة ' + (current.length + 1),
-        buffer: decodedBuffer,
+        buffer: rendered,
         blob,
-        start: trimStart,
-        end: trimEnd,
-        enhanced: cleanMode,
-        boostDb: editorBoostDb,
+        start: 0,
+        end: rendered.duration,
+        enhanced: false,
+        boostDb: 0,
       };
       void persistSoundPad(pad).catch(() =>
         setError('تعذر حفظ صوت Soundboard بشكل دائم.')
@@ -928,9 +1221,8 @@ function App() {
       return [...current, pad];
     });
   }, [
-    cleanMode,
     decodedBuffer,
-    editorBoostDb,
+    renderProcessedSelection,
     selectedClip,
     trimEnd,
     trimStart,
@@ -977,40 +1269,121 @@ function App() {
     if (
       editorMediaElementRef.current === audio &&
       editorPlaybackContextRef.current &&
+      editorPlaybackContextRef.current.state !== 'closed' &&
       editorGainNodeRef.current
     ) {
-      editorGainNodeRef.current.gain.value = gainFromDb(editorBoostDb);
       return editorPlaybackContextRef.current;
-    }
-
-    if (editorPlaybackContextRef.current) {
-      void editorPlaybackContextRef.current.close();
     }
 
     const ctx = new AudioContext();
     const source = ctx.createMediaElementSource(audio);
+
+    const low = ctx.createBiquadFilter();
+    low.type = 'lowshelf';
+    low.frequency.value = 180;
+
+    const mid = ctx.createBiquadFilter();
+    mid.type = 'peaking';
+    mid.frequency.value = 1300;
+    mid.Q.value = 0.8;
+
+    const high = ctx.createBiquadFilter();
+    high.type = 'highshelf';
+    high.frequency.value = 5200;
+
+    const compressor = ctx.createDynamicsCompressor();
+    const shaper = ctx.createWaveShaper();
+    shaper.oversample = '4x';
+    const pan = ctx.createStereoPanner();
     const gain = ctx.createGain();
     const limiter = ctx.createDynamicsCompressor();
-    gain.gain.value = gainFromDb(editorBoostDb);
-    limiter.threshold.value = -4;
-    limiter.knee.value = 8;
-    limiter.ratio.value = 18;
-    limiter.attack.value = 0.002;
-    limiter.release.value = 0.12;
 
-    source.connect(gain).connect(limiter).connect(ctx.destination);
+    source
+      .connect(low)
+      .connect(mid)
+      .connect(high)
+      .connect(compressor)
+      .connect(shaper)
+      .connect(pan)
+      .connect(gain)
+      .connect(limiter);
+
+    limiter.connect(ctx.destination);
+
+    const delay = ctx.createDelay(1);
+    delay.delayTime.value = 0.19;
+    const feedback = ctx.createGain();
+    feedback.gain.value = 0.28;
+    const delayWet = ctx.createGain();
+    limiter.connect(delay);
+    delay.connect(feedback).connect(delay);
+    delay.connect(delayWet).connect(ctx.destination);
+
+    const convolver = ctx.createConvolver();
+    convolver.buffer = createImpulseResponse(ctx, 1.7, 2.8);
+    const reverbWet = ctx.createGain();
+    limiter
+      .connect(convolver)
+      .connect(reverbWet)
+      .connect(ctx.destination);
+
     editorPlaybackContextRef.current = ctx;
     editorMediaSourceRef.current = source;
     editorMediaElementRef.current = audio;
     editorGainNodeRef.current = gain;
+    editorLowNodeRef.current = low;
+    editorMidNodeRef.current = mid;
+    editorHighNodeRef.current = high;
+    editorCompressorNodeRef.current = compressor;
+    editorDistortionNodeRef.current = shaper;
+    editorPanNodeRef.current = pan;
+    editorDelayWetRef.current = delayWet;
+    editorReverbWetRef.current = reverbWet;
     return ctx;
-  }, [editorBoostDb]);
+  }, []);
 
   useEffect(() => {
     if (editorGainNodeRef.current) {
       editorGainNodeRef.current.gain.value = gainFromDb(editorBoostDb);
     }
-  }, [editorBoostDb]);
+    if (editorLowNodeRef.current) editorLowNodeRef.current.gain.value = fxLowDb;
+    if (editorMidNodeRef.current) editorMidNodeRef.current.gain.value = fxMidDb;
+    if (editorHighNodeRef.current) {
+      editorHighNodeRef.current.gain.value = fxHighDb;
+    }
+    if (editorCompressorNodeRef.current) {
+      editorCompressorNodeRef.current.threshold.value =
+        fxCompressor === 0 ? 0 : -12 - (fxCompressor / 100) * 22;
+      editorCompressorNodeRef.current.ratio.value =
+        fxCompressor === 0 ? 1 : 2 + (fxCompressor / 100) * 10;
+      editorCompressorNodeRef.current.knee.value = 8;
+      editorCompressorNodeRef.current.attack.value = 0.004;
+      editorCompressorNodeRef.current.release.value = 0.16;
+    }
+    if (editorDistortionNodeRef.current) {
+      editorDistortionNodeRef.current.curve =
+        makeDistortionCurve(fxDistortion / 18);
+    }
+    if (editorPanNodeRef.current) {
+      editorPanNodeRef.current.pan.value = fxPan / 100;
+    }
+    if (editorDelayWetRef.current) {
+      editorDelayWetRef.current.gain.value = (fxDelay / 100) * 0.55;
+    }
+    if (editorReverbWetRef.current) {
+      editorReverbWetRef.current.gain.value = (fxReverb / 100) * 0.65;
+    }
+  }, [
+    editorBoostDb,
+    fxCompressor,
+    fxDelay,
+    fxDistortion,
+    fxHighDb,
+    fxLowDb,
+    fxMidDb,
+    fxPan,
+    fxReverb,
+  ]);
 
   const toggleEditorPlayback = useCallback(async () => {
     const audio = editorAudioRef.current;
@@ -1055,25 +1428,16 @@ function App() {
     [selectedClip]
   );
 
-  const saveTrimmedClip = useCallback(() => {
+  const saveTrimmedClip = useCallback(async () => {
     if (!decodedBuffer || !selectedClip || trimEnd <= trimStart) return;
-    const channel = decodedBuffer.getChannelData(0);
-    const from = Math.max(0, Math.floor(trimStart * decodedBuffer.sampleRate));
-    const to = Math.min(
-      channel.length,
-      Math.ceil(trimEnd * decodedBuffer.sampleRate)
-    );
-    const samples = channel.slice(from, to);
-    if (samples.length === 0) return;
-
-    const processedSamples = applyBoost(samples, editorBoostDb);
-    const blob = encodeWav(processedSamples, decodedBuffer.sampleRate);
-    const duration = processedSamples.length / decodedBuffer.sampleRate;
+    const rendered = await renderProcessedSelection();
+    if (!rendered) return;
+    const blob = encodeAudioBufferWav(rendered);
     const clip: Clip = {
       id: crypto.randomUUID(),
       blob,
       url: URL.createObjectURL(blob),
-      duration,
+      duration: rendered.duration,
       createdAt: new Date(),
       origin: 'trimmed',
     };
@@ -1081,17 +1445,40 @@ function App() {
     editorAudioRef.current?.pause();
     setEditorPlaying(false);
     setClips(current => [clip, ...current].slice(0, MAX_SAVED_CLIPS));
-    void saveClipLocally(clip, 'تم حفظ التعديل في لقطاتك.');
+    void saveClipLocally(clip, 'تم حفظ التعديل بالمؤثرات في لقطاتك.');
     setSelectedClipId(clip.id);
     setTrimStart(0);
-    setTrimEnd(duration);
+    setTrimEnd(rendered.duration);
     setEditorCurrentTime(0);
     setCleanMode(false);
   }, [
     decodedBuffer,
-    editorBoostDb,
+    renderProcessedSelection,
     saveClipLocally,
     selectedClip,
+    trimEnd,
+    trimStart,
+  ]);
+
+  const downloadProcessedSelection = useCallback(async () => {
+    if (!decodedBuffer || trimEnd <= trimStart) return;
+    const rendered = await renderProcessedSelection();
+    if (!rendered) return;
+    const blob = encodeAudioBufferWav(rendered);
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download =
+      'game-voice-edit-' +
+      new Date().toISOString().replace(/[:.]/g, '-') +
+      '.wav';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }, [
+    decodedBuffer,
+    renderProcessedSelection,
     trimEnd,
     trimStart,
   ]);
@@ -1520,6 +1907,75 @@ function App() {
             </div>
           </div>
 
+          <div className="effects-studio">
+            <div className="effects-head">
+              <div>
+                <div className="editor-kicker">
+                  <Sparkles size={16} /> EFFECTS STUDIO
+                </div>
+                <h3>استوديو المؤثرات</h3>
+                <p>
+                  عدّل الـEQ والضغط والصدى والتشويه والـPan، واسمعها مباشرة.
+                </p>
+              </div>
+              <button
+                className="fx-reset"
+                onClick={() => applyEffectsPreset('reset')}
+              >
+                إعادة ضبط
+              </button>
+            </div>
+
+            <div className="fx-presets">
+              <button onClick={() => applyEffectsPreset('clear')}>
+                صوت واضح
+              </button>
+              <button onClick={() => applyEffectsPreset('radio')}>
+                راديو
+              </button>
+              <button onClick={() => applyEffectsPreset('bass')}>
+                جهير
+              </button>
+              <button onClick={() => applyEffectsPreset('hall')}>
+                مسرح
+              </button>
+            </div>
+
+            <div className="fx-grid">
+              {[
+                ['Bass', fxLowDb, setFxLowDb, -12, 12, 'dB'],
+                ['Mid', fxMidDb, setFxMidDb, -12, 12, 'dB'],
+                ['Treble', fxHighDb, setFxHighDb, -12, 12, 'dB'],
+                ['Compressor', fxCompressor, setFxCompressor, 0, 100, '%'],
+                ['Reverb', fxReverb, setFxReverb, 0, 100, '%'],
+                ['Echo', fxDelay, setFxDelay, 0, 100, '%'],
+                ['Distortion', fxDistortion, setFxDistortion, 0, 100, '%'],
+                ['Pan', fxPan, setFxPan, -100, 100, ''],
+              ].map(([label, value, setter, min, max, unit]) => {
+                const setValue = setter as React.Dispatch<
+                  React.SetStateAction<number>
+                >;
+                return (
+                  <label key={String(label)}>
+                    <span>{String(label)}</span>
+                    <b>{Number(value)}{String(unit)}</b>
+                    <input
+                      aria-label={String(label)}
+                      type="range"
+                      min={Number(min)}
+                      max={Number(max)}
+                      step="1"
+                      value={Number(value)}
+                      onChange={event =>
+                        setValue(Number(event.target.value))
+                      }
+                    />
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
           <div className="timeline-card trim-timeline">
             <div className="waveform-guide">
               <span>صوت هادئ</span>
@@ -1542,357 +1998,3 @@ function App() {
                 selectionAnchorRef.current = time;
                 editorAudioRef.current?.pause();
                 if (editorAudioRef.current) editorAudioRef.current.currentTime = time;
-                setEditorCurrentTime(time);
-                setTrimStart(time);
-                setTrimEnd(Math.min(selectedClip.duration, time + 0.08));
-              }}
-              onPointerMove={event => {
-                const anchor = selectionAnchorRef.current;
-                if (anchor === null) return;
-                const time = waveformTimeFromClientX(event.clientX);
-                const start = Math.min(anchor, time);
-                const end = Math.max(anchor, time);
-                setTrimStart(start);
-                setTrimEnd(
-                  Math.min(selectedClip.duration, Math.max(start + 0.08, end))
-                );
-              }}
-              onPointerUp={event => {
-                if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                  event.currentTarget.releasePointerCapture(event.pointerId);
-                }
-                selectionAnchorRef.current = null;
-              }}
-              onPointerCancel={() => {
-                selectionAnchorRef.current = null;
-              }}
-            >
-              <div className="wave-center-line" />
-              {waveform.length === 0 ? (
-                <div className="waveform-loading">جاري تحليل موجة الصوت...</div>
-              ) : (
-                waveform.map((height, index) => {
-                  const time = (index / waveform.length) * selectedClip.duration;
-                  const active = time >= trimStart && time <= trimEnd;
-                  return (
-                    <span
-                      key={index}
-                      className={active ? 'wave-bar active' : 'wave-bar'}
-                      style={{ height: Math.max(5, height * 94) + '%' }}
-                    />
-                  );
-                })
-              )}
-
-              <div
-                className="selection-region"
-                style={{
-                  left: (trimStart / selectedClip.duration) * 100 + '%',
-                  width:
-                    ((trimEnd - trimStart) / selectedClip.duration) * 100 + '%',
-                }}
-              >
-                <span className="trim-handle trim-handle-start">
-                  {trimStart.toFixed(1)}
-                </span>
-                <span className="trim-handle trim-handle-end">
-                  {trimEnd.toFixed(1)}
-                </span>
-              </div>
-
-              <div
-                className="playhead"
-                style={{
-                  left:
-                    (Math.min(editorCurrentTime, selectedClip.duration) /
-                      selectedClip.duration) *
-                      100 +
-                    '%',
-                }}
-              />
-            </div>
-
-            <div className="precision-grid">
-              <label>
-                <span>بداية القص</span>
-                <strong>{trimStart.toFixed(1)} ث</strong>
-                <input
-                  aria-label="بداية القص"
-                  type="range"
-                  min="0"
-                  max={Math.max(0, selectedClip.duration - 0.1)}
-                  step="0.05"
-                  value={Math.min(
-                    trimStart,
-                    Math.max(0, selectedClip.duration - 0.1)
-                  )}
-                  onChange={event => {
-                    const next = Number(event.target.value);
-                    const value = Math.min(next, Math.max(0, trimEnd - 0.08));
-                    setTrimStart(value);
-                    if (editorAudioRef.current) {
-                      editorAudioRef.current.currentTime = value;
-                    }
-                    setEditorCurrentTime(value);
-                  }}
-                />
-              </label>
-
-              <label>
-                <span>نهاية القص</span>
-                <strong>{trimEnd.toFixed(1)} ث</strong>
-                <input
-                  aria-label="نهاية القص"
-                  type="range"
-                  min="0.08"
-                  max={selectedClip.duration}
-                  step="0.05"
-                  value={trimEnd}
-                  onChange={event => {
-                    const next = Number(event.target.value);
-                    setTrimEnd(Math.max(next, trimStart + 0.08));
-                  }}
-                />
-              </label>
-            </div>
-          </div>
-
-          {saveNotice && <div className="save-notice">{saveNotice}</div>}
-
-          <div className="editor-actions editor-cut-actions">
-            <button
-              className="editor-primary cut-save"
-              onClick={saveTrimmedClip}
-              disabled={!decodedBuffer || trimEnd <= trimStart}
-            >
-              <Scissors size={18} />
-              حفظ التعديل في لقطاتي
-            </button>
-            <button
-              className="ghost"
-              onClick={() => {
-                if (!decodedBuffer || trimEnd <= trimStart) return;
-                const channel = decodedBuffer.getChannelData(0);
-                const from = Math.max(
-                  0,
-                  Math.floor(trimStart * decodedBuffer.sampleRate)
-                );
-                const to = Math.min(
-                  channel.length,
-                  Math.ceil(trimEnd * decodedBuffer.sampleRate)
-                );
-                const samples = applyBoost(
-                  channel.slice(from, to),
-                  editorBoostDb
-                );
-                const blob = encodeWav(samples, decodedBuffer.sampleRate);
-                const anchor = document.createElement('a');
-                anchor.href = URL.createObjectURL(blob);
-                anchor.download =
-                  'game-voice-edit-' +
-                  new Date().toISOString().replace(/[:.]/g, '-') +
-                  '.wav';
-                document.body.appendChild(anchor);
-                anchor.click();
-                anchor.remove();
-                window.setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
-              }}
-              disabled={!decodedBuffer || trimEnd <= trimStart}
-            >
-              <Download size={17} />
-              تنزيل التعديل
-            </button>
-            <button
-              className="ghost"
-              onClick={() => {
-                editorAudioRef.current?.pause();
-                if (editorAudioRef.current) editorAudioRef.current.currentTime = 0;
-                setEditorCurrentTime(0);
-                setTrimStart(0);
-                setTrimEnd(selectedClip.duration);
-                setCleanMode(false);
-                setEditorBoostDb(0);
-              }}
-            >
-              <RotateCcw size={17} />
-              تحديد التسجيل كامل
-            </button>
-            <button
-              className="soundboard-add"
-              onClick={addToSoundboard}
-              disabled={!decodedBuffer}
-            >
-              <Plus size={17} />
-              أضف المحدد إلى Soundboard
-            </button>
-          </div>
-        </section>
-      )}
-
-      {selectedClip && (
-        <section className="panel highlights-panel">
-          <div className="soundboard-head">
-            <div>
-              <div className="editor-kicker"><Sparkles size={16} /> SMART HIGHLIGHTS</div>
-              <h2>اللحظات المقترحة</h2>
-              <p>تحليل محلي للشدة والـPeaks والتغيّر المفاجئ. الصوت ما يطلع من جهازك.</p>
-            </div>
-            <span>{highlights.length} اقتراحات</span>
-          </div>
-
-          {!decodedBuffer ? (
-            <div className="highlights-empty">جاري تحليل المقطع...</div>
-          ) : highlights.length === 0 ? (
-            <div className="highlights-empty">
-              ما لقيت ذروة واضحة في هذا المقطع. جرّب تسجيل أطول أو فيه كلام أكثر.
-            </div>
-          ) : (
-            <div className="highlights-grid">
-              {highlights.map(highlight => (
-                <article className="highlight-card" key={highlight.id}>
-                  <div className="highlight-top">
-                    <div>
-                      <strong>{highlight.label}</strong>
-                      <span>{highlight.detail}</span>
-                    </div>
-                    <b>{highlight.score}%</b>
-                  </div>
-                  <div className="highlight-time">
-                    {highlight.start.toFixed(1)}s — {highlight.end.toFixed(1)}s
-                  </div>
-                  <div className="highlight-actions">
-                    <button
-                      onClick={() =>
-                        decodedBuffer &&
-                        playBufferRange(
-                          decodedBuffer,
-                          highlight.start,
-                          highlight.end,
-                          true
-                        )
-                      }
-                    >
-                      <Play size={15} fill="currentColor" /> تشغيل
-                    </button>
-                    <button
-                      onClick={() => {
-                        setTrimStart(highlight.start);
-                        setTrimEnd(highlight.end);
-                        setCleanMode(true);
-                        document.getElementById('clip-editor')?.scrollIntoView({
-                          behavior: 'smooth',
-                          block: 'center',
-                        });
-                      }}
-                    >
-                      <Scissors size={15} /> افتح بالمحرر
-                    </button>
-                    <button onClick={() => addHighlightToSoundboard(highlight)}>
-                      <Plus size={15} /> Soundboard
-                    </button>
-                  </div>
-                </article>
-              ))}
-            </div>
-          )}
-        </section>
-      )}
-
-      {(soundPadsLoaded || soundPads.length > 0) && (
-        <section className="panel soundboard-panel">
-          <div className="soundboard-head">
-            <div>
-              <div className="editor-kicker"><Music2 size={16} /> SOUNDBOARD</div>
-              <h2>لوحة الأصوات</h2>
-              <p>
-                كل زر محفوظ تلقائيًا على هذا الجهاز ويرجع بعد إغلاق Chrome.
-              </p>
-            </div>
-            <span>{soundPads.length} أصوات</span>
-          </div>
-          {!soundPadsLoaded ? (
-            <div className="highlights-empty">جاري تحميل Soundboard المحفوظ...</div>
-          ) : soundPads.length === 0 ? (
-            <div className="highlights-empty">
-              ما أضفت أصوات للـSoundboard للحين.
-            </div>
-          ) : (
-          <div className="soundboard-grid">
-            {soundPads.map((pad, index) => (
-              <div className="sound-pad" key={pad.id}>
-                <button
-                  onClick={() =>
-                    playBufferRange(
-                      pad.buffer,
-                      pad.start,
-                      pad.end,
-                      pad.enhanced,
-                      pad.boostDb
-                    )
-                  }
-                >
-                  <Play size={20} fill="currentColor" />
-                  <strong>{pad.name}</strong>
-                  <small>
-                    {(pad.end - pad.start).toFixed(1)} ث
-                    {pad.enhanced ? ' · منظّف' : ''}
-                    {pad.boostDb > 0 ? ' · +' + pad.boostDb + ' dB' : ''}
-                  </small>
-                </button>
-                <div className="pad-footer">
-                  <input
-                    aria-label={'اسم زر الصوت ' + (index + 1)}
-                    value={pad.name}
-                    onChange={event => {
-                      const name = event.target.value;
-                      setSoundPads(current =>
-                        current.map(item => {
-                          if (item.id !== pad.id) return item;
-                          const updated = { ...item, name };
-                          void persistSoundPad(updated).catch(() =>
-                            setError('تعذر حفظ اسم صوت Soundboard.')
-                          );
-                          return updated;
-                        })
-                      );
-                    }}
-                  />
-                  <button
-                    className="pad-delete"
-                    aria-label="حذف زر الصوت"
-                    onClick={() => {
-                      setSoundPads(current =>
-                        current.filter(item => item.id !== pad.id)
-                      );
-                      void deleteStoredSoundPad(pad.id).catch(() =>
-                        setError('تعذر حذف صوت Soundboard المحفوظ.')
-                      );
-                    }}
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-          )}
-        </section>
-      )}
-
-      <footer>
-        <span>
-          Local-first · لقطاتك وSoundboard محفوظة على هذا الجهاز ولا تُرفع تلقائيًا
-        </span>
-        <span>أفضل نتيجة: Chrome/Edge + VB-CABLE</span>
-      </footer>
-    </main>
-  );
-}
-
-declare global {
-  interface Window {
-    webkitAudioContext: typeof AudioContext;
-  }
-}
-
-export default App;
