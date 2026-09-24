@@ -45,6 +45,105 @@ type Highlight = {
 
 type CaptureState = 'idle' | 'ready' | 'error';
 
+type StoredClip = {
+  id: string;
+  blob: Blob;
+  duration: number;
+  createdAt: number;
+  origin: Clip['origin'];
+};
+
+const CLIP_DB_NAME = 'game-voice-replay';
+const CLIP_STORE_NAME = 'clips';
+const MAX_SAVED_CLIPS = 30;
+
+function openClipDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(CLIP_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(CLIP_STORE_NAME)) {
+        db.createObjectStore(CLIP_STORE_NAME, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function loadStoredClips(): Promise<Clip[]> {
+  const db = await openClipDb();
+  try {
+    const records = await new Promise<StoredClip[]>((resolve, reject) => {
+      const transaction = db.transaction(CLIP_STORE_NAME, 'readonly');
+      const request = transaction.objectStore(CLIP_STORE_NAME).getAll();
+      request.onsuccess = () => resolve(request.result as StoredClip[]);
+      request.onerror = () => reject(request.error);
+    });
+    return records
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, MAX_SAVED_CLIPS)
+      .map(record => ({
+        id: record.id,
+        blob: record.blob,
+        url: URL.createObjectURL(record.blob),
+        duration: record.duration,
+        createdAt: new Date(record.createdAt),
+        origin: record.origin,
+      }));
+  } finally {
+    db.close();
+  }
+}
+
+async function persistClip(clip: Clip) {
+  const db = await openClipDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(CLIP_STORE_NAME, 'readwrite');
+      transaction.objectStore(CLIP_STORE_NAME).put({
+        id: clip.id,
+        blob: clip.blob,
+        duration: clip.duration,
+        createdAt: clip.createdAt.getTime(),
+        origin: clip.origin,
+      } satisfies StoredClip);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function deleteStoredClip(id: string) {
+  const db = await openClipDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(CLIP_STORE_NAME, 'readwrite');
+      transaction.objectStore(CLIP_STORE_NAME).delete(id);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function clearStoredClips() {
+  const db = await openClipDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(CLIP_STORE_NAME, 'readwrite');
+      transaction.objectStore(CLIP_STORE_NAME).clear();
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
 function encodeWav(samples: Float32Array, sampleRate: number) {
   const bytesPerSample = 2;
   const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample);
@@ -189,6 +288,8 @@ function App() {
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [editorPlaying, setEditorPlaying] = useState(false);
   const [editorCurrentTime, setEditorCurrentTime] = useState(0);
+  const [clipsLoaded, setClipsLoaded] = useState(false);
+  const [saveNotice, setSaveNotice] = useState('');
 
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -206,6 +307,45 @@ function App() {
   const instantUiUpdateRef = useRef(0);
   const waveformRef = useRef<HTMLDivElement | null>(null);
   const selectionAnchorRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const restoreClips = async () => {
+      try {
+        const stored = await loadStoredClips();
+        if (!cancelled) {
+          setClips(stored);
+          if (stored[0]) {
+            setSelectedClipId(stored[0].id);
+            setTrimStart(0);
+            setTrimEnd(stored[0].duration);
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          setError('تعذر تحميل اللقطات المحفوظة من هذا المتصفح.');
+        }
+      } finally {
+        if (!cancelled) setClipsLoaded(true);
+      }
+    };
+    void restoreClips();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const saveClipLocally = useCallback(async (clip: Clip, notice?: string) => {
+    try {
+      await persistClip(clip);
+      if (notice) {
+        setSaveNotice(notice);
+        window.setTimeout(() => setSaveNotice(''), 2400);
+      }
+    } catch {
+      setError('تعذر حفظ اللقطة بشكل دائم على هذا الجهاز.');
+    }
+  }, []);
 
   const resetInstantBuffer = useCallback(() => {
     instantChunksRef.current = [];
@@ -382,7 +522,8 @@ function App() {
           createdAt: new Date(),
           origin: 'recording',
         };
-        setClips(current => [clip, ...current].slice(0, 30));
+        setClips(current => [clip, ...current].slice(0, MAX_SAVED_CLIPS));
+        void saveClipLocally(clip);
         setSelectedClipId(clip.id);
         setTrimStart(0);
         setTrimEnd(duration);
@@ -399,7 +540,7 @@ function App() {
     timerRef.current = window.setInterval(() => {
       setElapsed((Date.now() - startedAtRef.current) / 1000);
     }, 100);
-  }, []);
+  }, [saveClipLocally]);
 
   const toggleRecording = useCallback(() => {
     if (recorderRef.current?.state === 'recording') stopRecording();
@@ -452,7 +593,8 @@ function App() {
       origin: 'instant',
     };
 
-    setClips(current => [clip, ...current].slice(0, 30));
+    setClips(current => [clip, ...current].slice(0, MAX_SAVED_CLIPS));
+    void saveClipLocally(clip);
     setSelectedClipId(clip.id);
     setTrimStart(0);
     setTrimEnd(duration);
@@ -466,7 +608,7 @@ function App() {
         });
       });
     });
-  }, [instantDuration]);
+  }, [instantDuration, saveClipLocally]);
 
   const replayLast = useCallback(() => {
     const clip = clips[0];
@@ -508,6 +650,9 @@ function App() {
       return current.filter(clip => clip.id !== id);
     });
     setSelectedClipId(current => (current === id ? null : current));
+    void deleteStoredClip(id).catch(() =>
+      setError('تعذر حذف اللقطة من التخزين الدائم.')
+    );
   }, []);
 
   const selectedClip = clips.find(clip => clip.id === selectedClipId) ?? clips[0] ?? null;
@@ -731,13 +876,14 @@ function App() {
 
     editorAudioRef.current?.pause();
     setEditorPlaying(false);
-    setClips(current => [clip, ...current].slice(0, 30));
+    setClips(current => [clip, ...current].slice(0, MAX_SAVED_CLIPS));
+    void saveClipLocally(clip, 'تم حفظ التعديل في لقطاتك.');
     setSelectedClipId(clip.id);
     setTrimStart(0);
     setTrimEnd(duration);
     setEditorCurrentTime(0);
     setCleanMode(false);
-  }, [decodedBuffer, selectedClip, trimEnd, trimStart]);
+  }, [decodedBuffer, saveClipLocally, selectedClip, trimEnd, trimStart]);
 
   useEffect(() => {
     void refreshDevices();
@@ -785,6 +931,9 @@ function App() {
     setSelectedClipId(null);
     setTrimStart(0);
     setTrimEnd(0);
+    void clearStoredClips().catch(() =>
+      setError('تعذر مسح اللقطات من التخزين الدائم.')
+    );
   };
 
   const statusLabel =
@@ -985,8 +1134,10 @@ function App() {
       <section className="panel clips-panel">
         <div className="clips-head">
           <div>
-            <h2>المقاطع الأخيرة</h2>
-            <p>تبقى محليًا في هذه الجلسة ولا تُرفع إلى سيرفر.</p>
+            <h2>لقطاتي المحفوظة</h2>
+            <p>
+              تُحفظ تلقائيًا على هذا الجهاز وتعود بعد إغلاق الموقع وفتحه مرة ثانية.
+            </p>
           </div>
           {clips.length > 0 && (
             <button className="ghost danger" onClick={clearAll}>
@@ -995,7 +1146,14 @@ function App() {
           )}
         </div>
 
-        {clips.length === 0 ? (
+        {!clipsLoaded ? (
+          <div className="empty">
+            <div className="empty-icon">
+              <Volume2 size={30} />
+            </div>
+            <strong>جاري تحميل لقطاتك...</strong>
+          </div>
+        ) : clips.length === 0 ? (
           <div className="empty">
             <div className="empty-icon">
               <Volume2 size={30} />
@@ -1251,6 +1409,8 @@ function App() {
             </div>
           </div>
 
+          {saveNotice && <div className="save-notice">{saveNotice}</div>}
+
           <div className="editor-actions editor-cut-actions">
             <button
               className="editor-primary cut-save"
@@ -1258,7 +1418,40 @@ function App() {
               disabled={!decodedBuffer || trimEnd <= trimStart}
             >
               <Scissors size={18} />
-              قص وحفظ كمقطع جديد
+              حفظ التعديل في لقطاتي
+            </button>
+            <button
+              className="ghost"
+              onClick={() => {
+                if (!decodedBuffer || trimEnd <= trimStart) return;
+                const channel = decodedBuffer.getChannelData(0);
+                const from = Math.max(
+                  0,
+                  Math.floor(trimStart * decodedBuffer.sampleRate)
+                );
+                const to = Math.min(
+                  channel.length,
+                  Math.ceil(trimEnd * decodedBuffer.sampleRate)
+                );
+                const blob = encodeWav(
+                  channel.slice(from, to),
+                  decodedBuffer.sampleRate
+                );
+                const anchor = document.createElement('a');
+                anchor.href = URL.createObjectURL(blob);
+                anchor.download =
+                  'game-voice-edit-' +
+                  new Date().toISOString().replace(/[:.]/g, '-') +
+                  '.wav';
+                document.body.appendChild(anchor);
+                anchor.click();
+                anchor.remove();
+                window.setTimeout(() => URL.revokeObjectURL(anchor.href), 0);
+              }}
+              disabled={!decodedBuffer || trimEnd <= trimStart}
+            >
+              <Download size={17} />
+              تنزيل التعديل
             </button>
             <button
               className="ghost"
@@ -1394,7 +1587,7 @@ function App() {
       )}
 
       <footer>
-        <span>Local-first · لا يوجد رفع تلقائي للصوت</span>
+        <span>Local-first · لقطاتك محفوظة على هذا الجهاز ولا تُرفع تلقائيًا</span>
         <span>أفضل نتيجة: Chrome/Edge + VB-CABLE</span>
       </footer>
     </main>
