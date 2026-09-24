@@ -29,9 +29,11 @@ type SoundPad = {
   id: string;
   name: string;
   buffer: AudioBuffer;
+  blob: Blob;
   start: number;
   end: number;
   enhanced: boolean;
+  boostDb: number;
 };
 
 type Highlight = {
@@ -53,17 +55,31 @@ type StoredClip = {
   origin: Clip['origin'];
 };
 
+type StoredSoundPad = {
+  id: string;
+  name: string;
+  blob: Blob;
+  duration: number;
+  enhanced: boolean;
+  boostDb: number;
+  createdAt: number;
+};
+
 const CLIP_DB_NAME = 'game-voice-replay';
 const CLIP_STORE_NAME = 'clips';
+const SOUND_PAD_STORE_NAME = 'soundPads';
 const MAX_SAVED_CLIPS = 30;
 
 function openClipDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(CLIP_DB_NAME, 1);
+    const request = indexedDB.open(CLIP_DB_NAME, 2);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(CLIP_STORE_NAME)) {
         db.createObjectStore(CLIP_STORE_NAME, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(SOUND_PAD_STORE_NAME)) {
+        db.createObjectStore(SOUND_PAD_STORE_NAME, { keyPath: 'id' });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -136,6 +152,85 @@ async function clearStoredClips() {
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction(CLIP_STORE_NAME, 'readwrite');
       transaction.objectStore(CLIP_STORE_NAME).clear();
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function loadStoredSoundPads(): Promise<SoundPad[]> {
+  const db = await openClipDb();
+  let records: StoredSoundPad[] = [];
+  try {
+    records = await new Promise<StoredSoundPad[]>((resolve, reject) => {
+      const transaction = db.transaction(SOUND_PAD_STORE_NAME, 'readonly');
+      const request = transaction.objectStore(SOUND_PAD_STORE_NAME).getAll();
+      request.onsuccess = () => resolve(request.result as StoredSoundPad[]);
+      request.onerror = () => reject(request.error);
+    });
+  } finally {
+    db.close();
+  }
+
+  if (records.length === 0) return [];
+
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AudioContextCtor();
+  try {
+    const pads = await Promise.all(
+      records
+        .sort((a, b) => a.createdAt - b.createdAt)
+        .map(async record => {
+          const arrayBuffer = await record.blob.arrayBuffer();
+          const buffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+          return {
+            id: record.id,
+            name: record.name,
+            buffer,
+            blob: record.blob,
+            start: 0,
+            end: Math.min(record.duration, buffer.duration),
+            enhanced: record.enhanced,
+            boostDb: record.boostDb ?? 0,
+          } satisfies SoundPad;
+        })
+    );
+    return pads;
+  } finally {
+    await ctx.close();
+  }
+}
+
+async function persistSoundPad(pad: SoundPad) {
+  const db = await openClipDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(SOUND_PAD_STORE_NAME, 'readwrite');
+      transaction.objectStore(SOUND_PAD_STORE_NAME).put({
+        id: pad.id,
+        name: pad.name,
+        blob: pad.blob,
+        duration: Math.max(0.05, pad.end - pad.start),
+        enhanced: pad.enhanced,
+        boostDb: pad.boostDb,
+        createdAt: Date.now(),
+      } satisfies StoredSoundPad);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function deleteStoredSoundPad(id: string) {
+  const db = await openClipDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(SOUND_PAD_STORE_NAME, 'readwrite');
+      transaction.objectStore(SOUND_PAD_STORE_NAME).delete(id);
       transaction.oncomplete = () => resolve();
       transaction.onerror = () => reject(transaction.error);
     });
@@ -307,6 +402,7 @@ function App() {
   const [decodedBuffer, setDecodedBuffer] = useState<AudioBuffer | null>(null);
   const [cleanMode, setCleanMode] = useState(false);
   const [soundPads, setSoundPads] = useState<SoundPad[]>([]);
+  const [soundPadsLoaded, setSoundPadsLoaded] = useState(false);
   const [instantEnabled, setInstantEnabled] = useState(false);
   const [instantDuration, setInstantDuration] = useState<30 | 60 | 120>(30);
   const [instantBufferedSeconds, setInstantBufferedSeconds] = useState(0);
@@ -360,6 +456,26 @@ function App() {
       }
     };
     void restoreClips();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const restoreSoundPads = async () => {
+      try {
+        const storedPads = await loadStoredSoundPads();
+        if (!cancelled) setSoundPads(storedPads);
+      } catch {
+        if (!cancelled) {
+          setError('تعذر تحميل أصوات Soundboard المحفوظة.');
+        }
+      } finally {
+        if (!cancelled) setSoundPadsLoaded(true);
+      }
+    };
+    void restoreSoundPads();
     return () => {
       cancelled = true;
     };
@@ -744,7 +860,14 @@ function App() {
     };
   }, [selectedClip]);
 
-  const playBufferRange = useCallback((buffer: AudioBuffer, start: number, end: number, enhanced: boolean) => {
+  const playBufferRange = useCallback(
+    (
+      buffer: AudioBuffer,
+      start: number,
+      end: number,
+      enhanced: boolean,
+      boostDb = 0
+    ) => {
     if (playbackContextRef.current) void playbackContextRef.current.close();
     const ctx = new AudioContext();
     playbackContextRef.current = ctx;
@@ -764,9 +887,10 @@ function App() {
       const to = Math.min(channel.length, Math.ceil(end * buffer.sampleRate));
       let peak = 0;
       for (let i = from; i < to; i += 32) peak = Math.max(peak, Math.abs(channel[i]));
-      gain.gain.value = peak > 0 ? Math.min(3, 0.9 / peak) : 1;
+      const normalizeGain = peak > 0 ? Math.min(3, 0.9 / peak) : 1;
+      gain.gain.value = normalizeGain * gainFromDb(boostDb);
     } else {
-      gain.gain.value = 1;
+      gain.gain.value = gainFromDb(boostDb);
     }
 
     source.connect(gain).connect(limiter).connect(ctx.destination);
@@ -816,34 +940,70 @@ function App() {
   }, [decodedBuffer]);
 
   const addToSoundboard = useCallback(() => {
-    if (!decodedBuffer || !selectedClip) return;
-    setSoundPads(current => [
-      ...current,
-      {
+    if (!decodedBuffer || !selectedClip || trimEnd <= trimStart) return;
+    const channel = decodedBuffer.getChannelData(0);
+    const from = Math.max(0, Math.floor(trimStart * decodedBuffer.sampleRate));
+    const to = Math.min(
+      channel.length,
+      Math.ceil(trimEnd * decodedBuffer.sampleRate)
+    );
+    const blob = encodeWav(channel.slice(from, to), decodedBuffer.sampleRate);
+
+    setSoundPads(current => {
+      const pad: SoundPad = {
         id: crypto.randomUUID(),
         name: 'لقطة ' + (current.length + 1),
         buffer: decodedBuffer,
+        blob,
         start: trimStart,
         end: trimEnd,
         enhanced: cleanMode,
-      },
-    ]);
-  }, [cleanMode, decodedBuffer, selectedClip, trimEnd, trimStart]);
+        boostDb: editorBoostDb,
+      };
+      void persistSoundPad(pad).catch(() =>
+        setError('تعذر حفظ صوت Soundboard بشكل دائم.')
+      );
+      return [...current, pad];
+    });
+  }, [
+    cleanMode,
+    decodedBuffer,
+    editorBoostDb,
+    selectedClip,
+    trimEnd,
+    trimStart,
+  ]);
 
   const addHighlightToSoundboard = useCallback(
     (highlight: Highlight) => {
       if (!decodedBuffer) return;
-      setSoundPads(current => [
-        ...current,
-        {
+      const channel = decodedBuffer.getChannelData(0);
+      const from = Math.max(
+        0,
+        Math.floor(highlight.start * decodedBuffer.sampleRate)
+      );
+      const to = Math.min(
+        channel.length,
+        Math.ceil(highlight.end * decodedBuffer.sampleRate)
+      );
+      const blob = encodeWav(channel.slice(from, to), decodedBuffer.sampleRate);
+
+      setSoundPads(current => {
+        const pad: SoundPad = {
           id: crypto.randomUUID(),
           name: 'هايلايت ' + (current.length + 1),
           buffer: decodedBuffer,
+          blob,
           start: highlight.start,
           end: highlight.end,
           enhanced: true,
-        },
-      ]);
+          boostDb: 0,
+        };
+        void persistSoundPad(pad).catch(() =>
+          setError('تعذر حفظ صوت Soundboard بشكل دائم.')
+        );
+        return [...current, pad];
+      });
     },
     [decodedBuffer]
   );
@@ -1676,34 +1836,76 @@ function App() {
         </section>
       )}
 
-      {soundPads.length > 0 && (
+      {(soundPadsLoaded || soundPads.length > 0) && (
         <section className="panel soundboard-panel">
           <div className="soundboard-head">
             <div>
               <div className="editor-kicker"><Music2 size={16} /> SOUNDBOARD</div>
               <h2>لوحة الأصوات</h2>
-              <p>كل زر هنا يشغّل الجزء اللي قصّيته فقط.</p>
+              <p>
+                كل زر محفوظ تلقائيًا على هذا الجهاز ويرجع بعد إغلاق Chrome.
+              </p>
             </div>
             <span>{soundPads.length} أصوات</span>
           </div>
+          {!soundPadsLoaded ? (
+            <div className="highlights-empty">جاري تحميل Soundboard المحفوظ...</div>
+          ) : soundPads.length === 0 ? (
+            <div className="highlights-empty">
+              ما أضفت أصوات للـSoundboard للحين.
+            </div>
+          ) : (
           <div className="soundboard-grid">
             {soundPads.map((pad, index) => (
               <div className="sound-pad" key={pad.id}>
-                <button onClick={() => playBufferRange(pad.buffer, pad.start, pad.end, pad.enhanced)}>
+                <button
+                  onClick={() =>
+                    playBufferRange(
+                      pad.buffer,
+                      pad.start,
+                      pad.end,
+                      pad.enhanced,
+                      pad.boostDb
+                    )
+                  }
+                >
                   <Play size={20} fill="currentColor" />
                   <strong>{pad.name}</strong>
-                  <small>{(pad.end - pad.start).toFixed(1)} ث {pad.enhanced ? '· منظّف' : ''}</small>
+                  <small>
+                    {(pad.end - pad.start).toFixed(1)} ث
+                    {pad.enhanced ? ' · منظّف' : ''}
+                    {pad.boostDb > 0 ? ' · +' + pad.boostDb + ' dB' : ''}
+                  </small>
                 </button>
                 <div className="pad-footer">
                   <input
                     aria-label={'اسم زر الصوت ' + (index + 1)}
                     value={pad.name}
-                    onChange={event => setSoundPads(current => current.map(item => item.id === pad.id ? { ...item, name: event.target.value } : item))}
+                    onChange={event => {
+                      const name = event.target.value;
+                      setSoundPads(current =>
+                        current.map(item => {
+                          if (item.id !== pad.id) return item;
+                          const updated = { ...item, name };
+                          void persistSoundPad(updated).catch(() =>
+                            setError('تعذر حفظ اسم صوت Soundboard.')
+                          );
+                          return updated;
+                        })
+                      );
+                    }}
                   />
                   <button
                     className="pad-delete"
                     aria-label="حذف زر الصوت"
-                    onClick={() => setSoundPads(current => current.filter(item => item.id !== pad.id))}
+                    onClick={() => {
+                      setSoundPads(current =>
+                        current.filter(item => item.id !== pad.id)
+                      );
+                      void deleteStoredSoundPad(pad.id).catch(() =>
+                        setError('تعذر حذف صوت Soundboard المحفوظ.')
+                      );
+                    }}
                   >
                     <Trash2 size={15} />
                   </button>
@@ -1711,11 +1913,14 @@ function App() {
               </div>
             ))}
           </div>
+          )}
         </section>
       )}
 
       <footer>
-        <span>Local-first · لقطاتك محفوظة على هذا الجهاز ولا تُرفع تلقائيًا</span>
+        <span>
+          Local-first · لقطاتك وSoundboard محفوظة على هذا الجهاز ولا تُرفع تلقائيًا
+        </span>
         <span>أفضل نتيجة: Chrome/Edge + VB-CABLE</span>
       </footer>
     </main>
