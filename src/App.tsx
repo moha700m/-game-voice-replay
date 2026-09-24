@@ -274,27 +274,6 @@ function gainFromDb(db: number) {
   return Math.pow(10, db / 20);
 }
 
-function applyBoost(samples: Float32Array, gainDb: number) {
-  if (gainDb <= 0) return samples.slice();
-  const gain = gainFromDb(gainDb);
-  const output = new Float32Array(samples.length);
-
-  for (let index = 0; index < samples.length; index += 1) {
-    const scaled = samples[index] * gain;
-    const magnitude = Math.abs(scaled);
-    if (magnitude <= 0.92) {
-      output[index] = scaled;
-      continue;
-    }
-
-    const compressed =
-      0.92 + (1 - Math.exp(-(magnitude - 0.92) * 3.2)) * 0.08;
-    output[index] = Math.sign(scaled) * Math.min(0.999, compressed);
-  }
-
-  return output;
-}
-
 function makeDistortionCurve(amount: number) {
   const curve = new Float32Array(2048);
   const drive = Math.max(0, amount) * 2.4;
