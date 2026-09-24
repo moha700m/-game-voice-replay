@@ -21,6 +21,7 @@ type Clip = {
   blob: Blob;
   duration: number;
   createdAt: Date;
+  origin: 'recording' | 'instant';
 };
 
 type SoundPad = {
@@ -32,7 +33,138 @@ type SoundPad = {
   enhanced: boolean;
 };
 
+type Highlight = {
+  id: string;
+  label: string;
+  detail: string;
+  start: number;
+  end: number;
+  score: number;
+};
+
 type CaptureState = 'idle' | 'ready' | 'error';
+
+function encodeWav(samples: Float32Array, sampleRate: number) {
+  const bytesPerSample = 2;
+  const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample);
+  const view = new DataView(buffer);
+  const writeText = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i += 1) view.setUint8(offset + i, value.charCodeAt(i));
+  };
+
+  writeText(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * bytesPerSample, true);
+  writeText(8, 'WAVE');
+  writeText(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeText(36, 'data');
+  view.setUint32(40, samples.length * bytesPerSample, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function detectHighlights(buffer: AudioBuffer): Highlight[] {
+  const channel = buffer.getChannelData(0);
+  const sampleRate = buffer.sampleRate;
+  const frameSeconds = 0.25;
+  const frameSize = Math.max(1, Math.floor(sampleRate * frameSeconds));
+  const frames: { rms: number; peak: number }[] = [];
+
+  for (let start = 0; start < channel.length; start += frameSize) {
+    const end = Math.min(channel.length, start + frameSize);
+    let sum = 0;
+    let peak = 0;
+    for (let i = start; i < end; i += 1) {
+      const value = channel[i];
+      sum += value * value;
+      peak = Math.max(peak, Math.abs(value));
+    }
+    frames.push({ rms: Math.sqrt(sum / Math.max(1, end - start)), peak });
+  }
+
+  const maxRms = Math.max(...frames.map(frame => frame.rms), 0);
+  const maxPeak = Math.max(...frames.map(frame => frame.peak), 0);
+  if (maxRms < 0.008 || buffer.duration < 0.6) return [];
+
+  const groupFrames = Math.max(4, Math.round(3 / frameSeconds));
+  const stepFrames = Math.max(1, Math.round(0.75 / frameSeconds));
+  const candidates: Highlight[] = [];
+
+  for (let index = 0; index < frames.length; index += stepFrames) {
+    const group = frames.slice(index, Math.min(frames.length, index + groupFrames));
+    if (group.length < 2) continue;
+
+    const avgRms = group.reduce((sum, frame) => sum + frame.rms, 0) / group.length;
+    const peak = Math.max(...group.map(frame => frame.peak));
+    let onset = 0;
+    let variation = 0;
+    for (let i = 1; i < group.length; i += 1) {
+      onset = Math.max(onset, group[i].rms - group[i - 1].rms);
+      variation += Math.abs(group[i].rms - group[i - 1].rms);
+    }
+    variation /= Math.max(1, group.length - 1);
+    const activeRatio = group.filter(frame => frame.rms > maxRms * 0.18).length / group.length;
+    if (activeRatio < 0.18) continue;
+
+    const rmsScore = avgRms / Math.max(maxRms, 0.0001);
+    const peakScore = peak / Math.max(maxPeak, 0.0001);
+    const onsetScore = Math.min(1, onset / Math.max(maxRms * 0.55, 0.0001));
+    const variationScore = Math.min(1, variation / Math.max(maxRms * 0.35, 0.0001));
+    const rawScore =
+      rmsScore * 0.38 +
+      peakScore * 0.24 +
+      onsetScore * 0.24 +
+      variationScore * 0.14;
+
+    const start = index * frameSeconds;
+    const end = Math.min(buffer.duration, start + group.length * frameSeconds);
+    let label = 'مقطع نشط';
+    let detail = 'نشاط صوتي مرتفع ومناسب للمراجعة.';
+
+    if (onsetScore > 0.72) {
+      label = 'ارتفاع مفاجئ';
+      detail = 'الصوت ارتفع بسرعة؛ غالبًا هنا صار رد أو انفعال.';
+    } else if (peakScore > 0.88) {
+      label = 'ذروة صوت';
+      detail = 'فيه Peak واضح داخل هذا الجزء.';
+    } else if (variationScore > 0.58) {
+      label = 'تغيّر قوي';
+      detail = 'تغيّر سريع في شدة الكلام قد يدل على لحظة ملفتة.';
+    }
+
+    candidates.push({
+      id: start.toFixed(2) + '-' + end.toFixed(2),
+      label,
+      detail,
+      start: Math.max(0, start - 0.2),
+      end: Math.min(buffer.duration, end + 0.35),
+      score: Math.round(Math.min(99, Math.max(1, rawScore * 100))),
+    });
+  }
+
+  const chosen: Highlight[] = [];
+  for (const candidate of candidates.sort((a, b) => b.score - a.score)) {
+    const overlaps = chosen.some(
+      item => candidate.start < item.end + 0.75 && candidate.end > item.start - 0.75
+    );
+    if (!overlaps) chosen.push(candidate);
+    if (chosen.length === 5) break;
+  }
+
+  return chosen.sort((a, b) => a.start - b.start);
+}
 
 function App() {
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -50,6 +182,10 @@ function App() {
   const [decodedBuffer, setDecodedBuffer] = useState<AudioBuffer | null>(null);
   const [cleanMode, setCleanMode] = useState(false);
   const [soundPads, setSoundPads] = useState<SoundPad[]>([]);
+  const [instantEnabled, setInstantEnabled] = useState(false);
+  const [instantDuration, setInstantDuration] = useState<30 | 60 | 120>(30);
+  const [instantBufferedSeconds, setInstantBufferedSeconds] = useState(0);
+  const [highlights, setHighlights] = useState<Highlight[]>([]);
 
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -60,8 +196,20 @@ function App() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const editorAudioRef = useRef<HTMLAudioElement | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
+  const instantEnabledRef = useRef(false);
+  const instantChunksRef = useRef<Float32Array[]>([]);
+  const instantTotalSamplesRef = useRef(0);
+  const instantSampleRateRef = useRef(48000);
+  const instantUiUpdateRef = useRef(0);
+
+  const resetInstantBuffer = useCallback(() => {
+    instantChunksRef.current = [];
+    instantTotalSamplesRef.current = 0;
+    setInstantBufferedSeconds(0);
+  }, []);
 
   const cleanupStream = useCallback(() => {
+    resetInstantBuffer();
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
@@ -74,7 +222,7 @@ function App() {
       cancelAnimationFrame(analyserFrameRef.current);
       analyserFrameRef.current = null;
     }
-  }, []);
+  }, [resetInstantBuffer]);
 
   const setupMeter = useCallback((stream: MediaStream) => {
     if (audioContextRef.current) void audioContextRef.current.close();
@@ -85,6 +233,39 @@ function App() {
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
     source.connect(analyser);
+
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+    const silentGain = ctx.createGain();
+    silentGain.gain.value = 0;
+    source.connect(processor);
+    processor.connect(silentGain).connect(ctx.destination);
+    instantSampleRateRef.current = ctx.sampleRate;
+    processor.onaudioprocess = event => {
+      if (!instantEnabledRef.current) return;
+      const input = event.inputBuffer.getChannelData(0);
+      const copy = new Float32Array(input.length);
+      copy.set(input);
+      instantChunksRef.current.push(copy);
+      instantTotalSamplesRef.current += copy.length;
+
+      const maxSamples = Math.floor(ctx.sampleRate * 120);
+      while (
+        instantTotalSamplesRef.current > maxSamples &&
+        instantChunksRef.current.length > 1
+      ) {
+        const removed = instantChunksRef.current.shift();
+        if (removed) instantTotalSamplesRef.current -= removed.length;
+      }
+
+      const now = performance.now();
+      if (now - instantUiUpdateRef.current > 250) {
+        instantUiUpdateRef.current = now;
+        setInstantBufferedSeconds(
+          Math.min(120, instantTotalSamplesRef.current / ctx.sampleRate)
+        );
+      }
+    };
+
     const data = new Uint8Array(analyser.frequencyBinCount);
 
     const tick = () => {
@@ -194,6 +375,7 @@ function App() {
           url: URL.createObjectURL(blob),
           duration,
           createdAt: new Date(),
+          origin: 'recording',
         };
         setClips(current => [clip, ...current].slice(0, 30));
         setSelectedClipId(clip.id);
@@ -218,6 +400,68 @@ function App() {
     if (recorderRef.current?.state === 'recording') stopRecording();
     else startRecording();
   }, [startRecording, stopRecording]);
+
+  const toggleInstantReplay = useCallback(() => {
+    if (!streamRef.current) {
+      setError('شغّل التقاط الصوت أولًا، وبعدها فعّل Instant Replay.');
+      return;
+    }
+    setError('');
+    const next = !instantEnabledRef.current;
+    instantEnabledRef.current = next;
+    setInstantEnabled(next);
+    resetInstantBuffer();
+  }, [resetInstantBuffer]);
+
+  const saveInstantReplay = useCallback(() => {
+    const sampleRate = instantSampleRateRef.current;
+    const totalSamples = instantTotalSamplesRef.current;
+    if (!instantEnabledRef.current || totalSamples < Math.floor(sampleRate * 0.25)) {
+      setError('البفر ما جمع صوت كفاية للحين. فعّل Instant Replay وانتظر شوي.');
+      return;
+    }
+
+    const wantedSamples = Math.min(
+      totalSamples,
+      Math.floor(sampleRate * instantDuration)
+    );
+    const output = new Float32Array(wantedSamples);
+    let writeOffset = wantedSamples;
+
+    for (let i = instantChunksRef.current.length - 1; i >= 0 && writeOffset > 0; i -= 1) {
+      const chunk = instantChunksRef.current[i];
+      const take = Math.min(writeOffset, chunk.length);
+      writeOffset -= take;
+      output.set(chunk.subarray(chunk.length - take), writeOffset);
+    }
+
+    const usable = writeOffset === 0 ? output : output.slice(writeOffset);
+    const duration = usable.length / sampleRate;
+    const blob = encodeWav(usable, sampleRate);
+    const clip: Clip = {
+      id: crypto.randomUUID(),
+      blob,
+      url: URL.createObjectURL(blob),
+      duration,
+      createdAt: new Date(),
+      origin: 'instant',
+    };
+
+    setClips(current => [clip, ...current].slice(0, 30));
+    setSelectedClipId(clip.id);
+    setTrimStart(0);
+    setTrimEnd(duration);
+    setCleanMode(false);
+    setError('');
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        document.getElementById('clip-editor')?.scrollIntoView({
+          behavior: 'smooth',
+          block: 'center',
+        });
+      });
+    });
+  }, [instantDuration]);
 
   const replayLast = useCallback(() => {
     const clip = clips[0];
@@ -277,6 +521,7 @@ function App() {
     let cancelled = false;
     setWaveform([]);
     setDecodedBuffer(null);
+    setHighlights([]);
     if (!selectedClip) return;
 
     const decode = async () => {
@@ -300,6 +545,7 @@ function App() {
         const maxPeak = Math.max(...peaks, 0.0001);
         setWaveform(peaks.map(peak => Math.max(0.04, peak / maxPeak)));
         setDecodedBuffer(buffer);
+        setHighlights(detectHighlights(buffer));
       } catch {
         if (!cancelled) setError('تعذر تحليل شكل الموجة لهذا التسجيل.');
       }
@@ -384,19 +630,36 @@ function App() {
 
   const addToSoundboard = useCallback(() => {
     if (!decodedBuffer || !selectedClip) return;
-    const padNumber = soundPads.length + 1;
     setSoundPads(current => [
       ...current,
       {
         id: crypto.randomUUID(),
-        name: 'لقطة ' + padNumber,
+        name: 'لقطة ' + (current.length + 1),
         buffer: decodedBuffer,
         start: trimStart,
         end: trimEnd,
         enhanced: cleanMode,
       },
     ]);
-  }, [cleanMode, decodedBuffer, selectedClip, soundPads.length, trimEnd, trimStart]);
+  }, [cleanMode, decodedBuffer, selectedClip, trimEnd, trimStart]);
+
+  const addHighlightToSoundboard = useCallback(
+    (highlight: Highlight) => {
+      if (!decodedBuffer) return;
+      setSoundPads(current => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          name: 'هايلايت ' + (current.length + 1),
+          buffer: decodedBuffer,
+          start: highlight.start,
+          end: highlight.end,
+          enhanced: true,
+        },
+      ]);
+    },
+    [decodedBuffer]
+  );
 
   const playSelection = useCallback(() => {
     if (!decodedBuffer) return;
@@ -442,10 +705,14 @@ function App() {
         event.preventDefault();
         downloadLast();
       }
+      if (event.code === 'Digit4') {
+        event.preventDefault();
+        saveInstantReplay();
+      }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [downloadLast, replayLast, toggleRecording]);
+  }, [downloadLast, replayLast, saveInstantReplay, toggleRecording]);
 
   const clearAll = () => {
     clips.forEach(clip => URL.revokeObjectURL(clip.url));
@@ -531,6 +798,73 @@ function App() {
 
       {error && <div className="error-box">{error}</div>}
 
+      <section className="panel instant-panel">
+        <div className="instant-head">
+          <div>
+            <div className="editor-kicker"><RotateCcw size={16} /> INSTANT REPLAY</div>
+            <h2>خذ اللي صار قبل ما تضغط</h2>
+            <p>يحفظ آخر 120 ثانية داخل ذاكرة المتصفح فقط. اختر المدة ثم خذ آخر جزء فورًا.</p>
+          </div>
+          <div className={instantEnabled ? 'instant-live on' : 'instant-live'}>
+            <span />
+            {instantEnabled ? 'البفر شغال' : 'البفر متوقف'}
+          </div>
+        </div>
+
+        <div className="instant-controls">
+          <button
+            className={instantEnabled ? 'instant-toggle active' : 'instant-toggle'}
+            onClick={toggleInstantReplay}
+          >
+            <Circle size={16} fill="currentColor" />
+            {instantEnabled ? 'إيقاف البفر' : 'تشغيل البفر'}
+          </button>
+
+          <div className="duration-switch" aria-label="مدة Instant Replay">
+            {([30, 60, 120] as const).map(seconds => (
+              <button
+                key={seconds}
+                className={instantDuration === seconds ? 'active' : ''}
+                onClick={() => setInstantDuration(seconds)}
+              >
+                {seconds}ث
+              </button>
+            ))}
+          </div>
+
+          <button
+            className="instant-save"
+            disabled={!instantEnabled || instantBufferedSeconds < 0.25}
+            onClick={saveInstantReplay}
+          >
+            <Scissors size={18} />
+            خذ آخر {instantDuration} ثانية
+            <small>Ctrl + Shift + 4</small>
+          </button>
+        </div>
+
+        <div className="instant-buffer">
+          <div>
+            <span>المتوفر الآن</span>
+            <strong>{instantBufferedSeconds.toFixed(1)} ث</strong>
+          </div>
+          <div className="instant-progress">
+            <span
+              style={{
+                width:
+                  Math.min(100, (instantBufferedSeconds / instantDuration) * 100) +
+                  '%',
+              }}
+            />
+          </div>
+          <small>
+            {instantBufferedSeconds >= instantDuration
+              ? 'جاهز لحفظ المدة كاملة.'
+              : 'البفر يتعبّى تلقائيًا وأنت تلعب.'}
+          </small>
+        </div>
+      </section>
+
       <section className="control-grid">
         <button
           className={'record-card ' + (recording ? 'recording' : '')}
@@ -578,7 +912,7 @@ function App() {
         <div>
           <strong>اختصارات سريعة</strong>
           <p>
-            Ctrl + Shift + 1 للتسجيل، Ctrl + Shift + 2 لإعادة آخر صوت، وCtrl + Shift + 3 للحفظ. تعمل عندما تكون صفحة الموقع نشطة.
+            Ctrl + Shift + 1 للتسجيل، Ctrl + Shift + 2 لإعادة آخر صوت، Ctrl + Shift + 3 للحفظ، وCtrl + Shift + 4 لأخذ Instant Replay. تعمل عندما تكون صفحة الموقع نشطة.
           </p>
         </div>
       </section>
@@ -614,8 +948,12 @@ function App() {
                 <div className="clip-meta">
                   <strong>
                     {index === 0
-                      ? 'آخر مقطع'
-                      : 'مقطع ' + (clips.length - index)}
+                      ? clip.origin === 'instant'
+                        ? 'آخر Instant Replay'
+                        : 'آخر مقطع'
+                      : clip.origin === 'instant'
+                        ? 'Instant Replay'
+                        : 'مقطع ' + (clips.length - index)}
                   </strong>
                   <span>
                     {clip.createdAt.toLocaleTimeString('ar-SA')} ·{' '}
@@ -774,6 +1112,75 @@ function App() {
               أضف الجزء إلى Soundboard
             </button>
           </div>
+        </section>
+      )}
+
+      {selectedClip && (
+        <section className="panel highlights-panel">
+          <div className="soundboard-head">
+            <div>
+              <div className="editor-kicker"><Sparkles size={16} /> SMART HIGHLIGHTS</div>
+              <h2>اللحظات المقترحة</h2>
+              <p>تحليل محلي للشدة والـPeaks والتغيّر المفاجئ. الصوت ما يطلع من جهازك.</p>
+            </div>
+            <span>{highlights.length} اقتراحات</span>
+          </div>
+
+          {!decodedBuffer ? (
+            <div className="highlights-empty">جاري تحليل المقطع...</div>
+          ) : highlights.length === 0 ? (
+            <div className="highlights-empty">
+              ما لقيت ذروة واضحة في هذا المقطع. جرّب تسجيل أطول أو فيه كلام أكثر.
+            </div>
+          ) : (
+            <div className="highlights-grid">
+              {highlights.map(highlight => (
+                <article className="highlight-card" key={highlight.id}>
+                  <div className="highlight-top">
+                    <div>
+                      <strong>{highlight.label}</strong>
+                      <span>{highlight.detail}</span>
+                    </div>
+                    <b>{highlight.score}%</b>
+                  </div>
+                  <div className="highlight-time">
+                    {highlight.start.toFixed(1)}s — {highlight.end.toFixed(1)}s
+                  </div>
+                  <div className="highlight-actions">
+                    <button
+                      onClick={() =>
+                        decodedBuffer &&
+                        playBufferRange(
+                          decodedBuffer,
+                          highlight.start,
+                          highlight.end,
+                          true
+                        )
+                      }
+                    >
+                      <Play size={15} fill="currentColor" /> تشغيل
+                    </button>
+                    <button
+                      onClick={() => {
+                        setTrimStart(highlight.start);
+                        setTrimEnd(highlight.end);
+                        setCleanMode(true);
+                        document.getElementById('clip-editor')?.scrollIntoView({
+                          behavior: 'smooth',
+                          block: 'center',
+                        });
+                      }}
+                    >
+                      <Scissors size={15} /> افتح بالمحرر
+                    </button>
+                    <button onClick={() => addHighlightToSoundboard(highlight)}>
+                      <Plus size={15} /> Soundboard
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
         </section>
       )}
 
