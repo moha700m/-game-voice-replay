@@ -175,6 +175,31 @@ function encodeWav(samples: Float32Array, sampleRate: number) {
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
+function gainFromDb(db: number) {
+  return Math.pow(10, db / 20);
+}
+
+function applyBoost(samples: Float32Array, gainDb: number) {
+  if (gainDb <= 0) return samples.slice();
+  const gain = gainFromDb(gainDb);
+  const output = new Float32Array(samples.length);
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const scaled = samples[index] * gain;
+    const magnitude = Math.abs(scaled);
+    if (magnitude <= 0.92) {
+      output[index] = scaled;
+      continue;
+    }
+
+    const compressed =
+      0.92 + (1 - Math.exp(-(magnitude - 0.92) * 3.2)) * 0.08;
+    output[index] = Math.sign(scaled) * Math.min(0.999, compressed);
+  }
+
+  return output;
+}
+
 function detectHighlights(buffer: AudioBuffer): Highlight[] {
   const channel = buffer.getChannelData(0);
   const sampleRate = buffer.sampleRate;
@@ -290,6 +315,7 @@ function App() {
   const [editorCurrentTime, setEditorCurrentTime] = useState(0);
   const [clipsLoaded, setClipsLoaded] = useState(false);
   const [saveNotice, setSaveNotice] = useState('');
+  const [editorBoostDb, setEditorBoostDb] = useState(0);
 
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -307,6 +333,10 @@ function App() {
   const instantUiUpdateRef = useRef(0);
   const waveformRef = useRef<HTMLDivElement | null>(null);
   const selectionAnchorRef = useRef<number | null>(null);
+  const editorPlaybackContextRef = useRef<AudioContext | null>(null);
+  const editorMediaSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const editorMediaElementRef = useRef<HTMLAudioElement | null>(null);
+  const editorGainNodeRef = useRef<GainNode | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -661,6 +691,7 @@ function App() {
     editorAudioRef.current?.pause();
     setEditorPlaying(false);
     setEditorCurrentTime(0);
+    setEditorBoostDb(0);
     setSelectedClipId(clip.id);
     setTrimStart(0);
     setTrimEnd(clip.duration);
@@ -677,6 +708,7 @@ function App() {
     setHighlights([]);
     setEditorPlaying(false);
     setEditorCurrentTime(0);
+    setEditorBoostDb(0);
     if (!selectedClip) return;
 
     const decode = async () => {
@@ -816,13 +848,60 @@ function App() {
     [decodedBuffer]
   );
 
-  const toggleEditorPlayback = useCallback(() => {
+  const ensureEditorAudioGraph = useCallback(() => {
+    const audio = editorAudioRef.current;
+    if (!audio) return null;
+
+    if (
+      editorMediaElementRef.current === audio &&
+      editorPlaybackContextRef.current &&
+      editorGainNodeRef.current
+    ) {
+      editorGainNodeRef.current.gain.value = gainFromDb(editorBoostDb);
+      return editorPlaybackContextRef.current;
+    }
+
+    if (editorPlaybackContextRef.current) {
+      void editorPlaybackContextRef.current.close();
+    }
+
+    const ctx = new AudioContext();
+    const source = ctx.createMediaElementSource(audio);
+    const gain = ctx.createGain();
+    const limiter = ctx.createDynamicsCompressor();
+    gain.gain.value = gainFromDb(editorBoostDb);
+    limiter.threshold.value = -4;
+    limiter.knee.value = 8;
+    limiter.ratio.value = 18;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.12;
+
+    source.connect(gain).connect(limiter).connect(ctx.destination);
+    editorPlaybackContextRef.current = ctx;
+    editorMediaSourceRef.current = source;
+    editorMediaElementRef.current = audio;
+    editorGainNodeRef.current = gain;
+    return ctx;
+  }, [editorBoostDb]);
+
+  useEffect(() => {
+    if (editorGainNodeRef.current) {
+      editorGainNodeRef.current.gain.value = gainFromDb(editorBoostDb);
+    }
+  }, [editorBoostDb]);
+
+  const toggleEditorPlayback = useCallback(async () => {
     const audio = editorAudioRef.current;
     if (!audio || !selectedClip) return;
 
     if (!audio.paused) {
       audio.pause();
       return;
+    }
+
+    const context = ensureEditorAudioGraph();
+    if (context?.state === 'suspended') {
+      await context.resume();
     }
 
     if (
@@ -833,10 +912,12 @@ function App() {
       setEditorCurrentTime(trimStart);
     }
 
-    void audio.play().catch(() =>
-      setError('المتصفح منع التشغيل. اضغط تشغيل مرة ثانية.')
-    );
-  }, [selectedClip, trimEnd, trimStart]);
+    try {
+      await audio.play();
+    } catch {
+      setError('المتصفح منع التشغيل. اضغط تشغيل مرة ثانية.');
+    }
+  }, [ensureEditorAudioGraph, selectedClip, trimEnd, trimStart]);
 
   const waveformTimeFromClientX = useCallback(
     (clientX: number) => {
@@ -863,8 +944,9 @@ function App() {
     const samples = channel.slice(from, to);
     if (samples.length === 0) return;
 
-    const blob = encodeWav(samples, decodedBuffer.sampleRate);
-    const duration = samples.length / decodedBuffer.sampleRate;
+    const processedSamples = applyBoost(samples, editorBoostDb);
+    const blob = encodeWav(processedSamples, decodedBuffer.sampleRate);
+    const duration = processedSamples.length / decodedBuffer.sampleRate;
     const clip: Clip = {
       id: crypto.randomUUID(),
       blob,
@@ -883,7 +965,14 @@ function App() {
     setTrimEnd(duration);
     setEditorCurrentTime(0);
     setCleanMode(false);
-  }, [decodedBuffer, saveClipLocally, selectedClip, trimEnd, trimStart]);
+  }, [
+    decodedBuffer,
+    editorBoostDb,
+    saveClipLocally,
+    selectedClip,
+    trimEnd,
+    trimStart,
+  ]);
 
   useEffect(() => {
     void refreshDevices();
@@ -1272,6 +1361,43 @@ function App() {
             </div>
           </div>
 
+          <div className="boost-panel">
+            <div className="boost-head">
+              <div className="boost-title">
+                <span className="boost-icon">
+                  <Volume2 size={19} />
+                </span>
+                <div>
+                  <strong>Boost الصوت</strong>
+                  <small>ارفع قوة الصوت مع Limiter لتقليل التشويه.</small>
+                </div>
+              </div>
+              <b>{editorBoostDb === 0 ? 'عادي' : '+' + editorBoostDb + ' dB'}</b>
+            </div>
+
+            <input
+              aria-label="قوة Boost الصوت"
+              type="range"
+              min="0"
+              max="12"
+              step="1"
+              value={editorBoostDb}
+              onChange={event => setEditorBoostDb(Number(event.target.value))}
+            />
+
+            <div className="boost-presets" aria-label="اختيارات Boost سريعة">
+              {[0, 3, 6, 9, 12].map(db => (
+                <button
+                  key={db}
+                  className={editorBoostDb === db ? 'active' : ''}
+                  onClick={() => setEditorBoostDb(db)}
+                >
+                  {db === 0 ? 'عادي' : '+' + db + ' dB'}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div className="timeline-card trim-timeline">
             <div className="waveform-guide">
               <span>صوت هادئ</span>
@@ -1433,10 +1559,11 @@ function App() {
                   channel.length,
                   Math.ceil(trimEnd * decodedBuffer.sampleRate)
                 );
-                const blob = encodeWav(
+                const samples = applyBoost(
                   channel.slice(from, to),
-                  decodedBuffer.sampleRate
+                  editorBoostDb
                 );
+                const blob = encodeWav(samples, decodedBuffer.sampleRate);
                 const anchor = document.createElement('a');
                 anchor.href = URL.createObjectURL(blob);
                 anchor.download =
@@ -1462,6 +1589,7 @@ function App() {
                 setTrimStart(0);
                 setTrimEnd(selectedClip.duration);
                 setCleanMode(false);
+                setEditorBoostDb(0);
               }}
             >
               <RotateCcw size={17} />
