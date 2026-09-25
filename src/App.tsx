@@ -68,7 +68,7 @@ type StoredSoundPad = {
 const CLIP_DB_NAME = 'game-voice-replay';
 const CLIP_STORE_NAME = 'clips';
 const SOUND_PAD_STORE_NAME = 'soundPads';
-const MAX_SAVED_CLIPS = 30;
+const MAX_SAVED_CLIPS = 100;
 
 function openClipDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -284,7 +284,7 @@ function applyBoost(samples: Float32Array, gainDb: number) {
 function detectHighlights(buffer: AudioBuffer): Highlight[] {
   const channel = buffer.getChannelData(0);
   const sampleRate = buffer.sampleRate;
-  const frameSeconds = 0.25;
+  const frameSeconds = 0.1;
   const frameSize = Math.max(1, Math.floor(sampleRate * frameSeconds));
   const frames: { rms: number; peak: number }[] = [];
 
@@ -297,76 +297,137 @@ function detectHighlights(buffer: AudioBuffer): Highlight[] {
       sum += value * value;
       peak = Math.max(peak, Math.abs(value));
     }
-    frames.push({ rms: Math.sqrt(sum / Math.max(1, end - start)), peak });
+    frames.push({
+      rms: Math.sqrt(sum / Math.max(1, end - start)),
+      peak,
+    });
   }
 
   const maxRms = Math.max(...frames.map(frame => frame.rms), 0);
   const maxPeak = Math.max(...frames.map(frame => frame.peak), 0);
-  if (maxRms < 0.008 || buffer.duration < 0.6) return [];
+  if (maxRms < 0.006 || buffer.duration < 0.4) return [];
 
-  const groupFrames = Math.max(4, Math.round(3 / frameSeconds));
-  const stepFrames = Math.max(1, Math.round(0.75 / frameSeconds));
+  const groupFrames = Math.max(8, Math.round(1.8 / frameSeconds));
+  const stepFrames = Math.max(1, Math.round(0.25 / frameSeconds));
+  const activeThreshold = Math.max(0.008, maxRms * 0.14);
   const candidates: Highlight[] = [];
 
   for (let index = 0; index < frames.length; index += stepFrames) {
-    const group = frames.slice(index, Math.min(frames.length, index + groupFrames));
-    if (group.length < 2) continue;
+    const group = frames.slice(
+      index,
+      Math.min(frames.length, index + groupFrames)
+    );
+    if (group.length < 3) continue;
 
-    const avgRms = group.reduce((sum, frame) => sum + frame.rms, 0) / group.length;
+    const avgRms =
+      group.reduce((sum, frame) => sum + frame.rms, 0) / group.length;
     const peak = Math.max(...group.map(frame => frame.peak));
     let onset = 0;
     let variation = 0;
+
     for (let i = 1; i < group.length; i += 1) {
       onset = Math.max(onset, group[i].rms - group[i - 1].rms);
       variation += Math.abs(group[i].rms - group[i - 1].rms);
     }
     variation /= Math.max(1, group.length - 1);
-    const activeRatio = group.filter(frame => frame.rms > maxRms * 0.18).length / group.length;
-    if (activeRatio < 0.18) continue;
+
+    const activeIndexes = group
+      .map((frame, groupIndex) =>
+        frame.rms >= activeThreshold || frame.peak >= maxPeak * 0.32
+          ? groupIndex
+          : -1
+      )
+      .filter(groupIndex => groupIndex >= 0);
+
+    const activeRatio = activeIndexes.length / group.length;
+    if (activeRatio < 0.1 || activeIndexes.length === 0) continue;
 
     const rmsScore = avgRms / Math.max(maxRms, 0.0001);
     const peakScore = peak / Math.max(maxPeak, 0.0001);
-    const onsetScore = Math.min(1, onset / Math.max(maxRms * 0.55, 0.0001));
-    const variationScore = Math.min(1, variation / Math.max(maxRms * 0.35, 0.0001));
+    const onsetScore = Math.min(
+      1,
+      onset / Math.max(maxRms * 0.42, 0.0001)
+    );
+    const variationScore = Math.min(
+      1,
+      variation / Math.max(maxRms * 0.28, 0.0001)
+    );
+
     const rawScore =
-      rmsScore * 0.38 +
-      peakScore * 0.24 +
-      onsetScore * 0.24 +
+      rmsScore * 0.34 +
+      peakScore * 0.25 +
+      onsetScore * 0.27 +
       variationScore * 0.14;
 
-    const start = index * frameSeconds;
-    const end = Math.min(buffer.duration, start + group.length * frameSeconds);
-    let label = 'مقطع نشط';
-    let detail = 'نشاط صوتي مرتفع ومناسب للمراجعة.';
+    const firstActive = activeIndexes[0];
+    const lastActive = activeIndexes[activeIndexes.length - 1];
+    const preciseStart =
+      (index + firstActive) * frameSeconds;
+    const preciseEnd =
+      (index + lastActive + 1) * frameSeconds;
 
-    if (onsetScore > 0.72) {
+    const start = Math.max(0, preciseStart - 0.12);
+    const end = Math.min(buffer.duration, preciseEnd + 0.22);
+    if (end - start < 0.25) continue;
+
+    let label = 'مقطع نشط';
+    let detail = 'نشاط صوتي واضح ومناسب للحفظ أو المراجعة.';
+
+    if (onsetScore > 0.68) {
       label = 'ارتفاع مفاجئ';
       detail = 'الصوت ارتفع بسرعة؛ غالبًا هنا صار رد أو انفعال.';
-    } else if (peakScore > 0.88) {
+    } else if (peakScore > 0.84) {
       label = 'ذروة صوت';
       detail = 'فيه Peak واضح داخل هذا الجزء.';
-    } else if (variationScore > 0.58) {
+    } else if (variationScore > 0.5) {
       label = 'تغيّر قوي';
       detail = 'تغيّر سريع في شدة الكلام قد يدل على لحظة ملفتة.';
     }
 
     candidates.push({
-      id: start.toFixed(2) + '-' + end.toFixed(2),
+      id:
+        start.toFixed(2) +
+        '-' +
+        end.toFixed(2) +
+        '-' +
+        index,
       label,
       detail,
-      start: Math.max(0, start - 0.2),
-      end: Math.min(buffer.duration, end + 0.35),
-      score: Math.round(Math.min(99, Math.max(1, rawScore * 100))),
+      start,
+      end,
+      score: Math.round(
+        Math.min(99, Math.max(1, rawScore * 100))
+      ),
     });
   }
 
   const chosen: Highlight[] = [];
   for (const candidate of candidates.sort((a, b) => b.score - a.score)) {
-    const overlaps = chosen.some(
-      item => candidate.start < item.end + 0.75 && candidate.end > item.start - 0.75
-    );
-    if (!overlaps) chosen.push(candidate);
-    if (chosen.length === 5) break;
+    const duplicate = chosen.some(item => {
+      const overlap =
+        Math.max(
+          0,
+          Math.min(candidate.end, item.end) -
+            Math.max(candidate.start, item.start)
+        );
+      const shorter = Math.max(
+        0.001,
+        Math.min(
+          candidate.end - candidate.start,
+          item.end - item.start
+        )
+      );
+      const overlapRatio = overlap / shorter;
+      const centerDistance = Math.abs(
+        (candidate.start + candidate.end) / 2 -
+          (item.start + item.end) / 2
+      );
+
+      return overlapRatio > 0.62 && centerDistance < 0.65;
+    });
+
+    if (!duplicate) chosen.push(candidate);
+    if (chosen.length === 12) break;
   }
 
   return chosen.sort((a, b) => a.start - b.start);
@@ -1721,7 +1782,7 @@ function App() {
             <div>
               <div className="editor-kicker"><Sparkles size={16} /> SMART HIGHLIGHTS</div>
               <h2>اللحظات المقترحة</h2>
-              <p>تحليل محلي للشدة والـPeaks والتغيّر المفاجئ. الصوت ما يطلع من جهازك.</p>
+              <p>تحليل أدق كل 0.1 ثانية تقريبًا ويطلع حتى 12 لحظة. الصوت ما يطلع من جهازك.</p>
             </div>
             <span>{highlights.length} اقتراحات</span>
           </div>
