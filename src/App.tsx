@@ -427,7 +427,7 @@ function detectHighlights(buffer: AudioBuffer): Highlight[] {
     });
 
     if (!duplicate) chosen.push(candidate);
-    if (chosen.length === 12) break;
+    if (chosen.length === 20) break;
   }
 
   return chosen.sort((a, b) => a.start - b.start);
@@ -1782,7 +1782,7 @@ function App() {
             <div>
               <div className="editor-kicker"><Sparkles size={16} /> SMART HIGHLIGHTS</div>
               <h2>اللحظات المقترحة</h2>
-              <p>تحليل أدق كل 0.1 ثانية تقريبًا ويطلع حتى 12 لحظة. الصوت ما يطلع من جهازك.</p>
+              <p>تحليل أدق كل 0.1 ثانية تقريبًا ويطلع حتى 20 لحظة. الصوت ما يطلع من جهازك.</p>
             </div>
             <span>{highlights.length} اقتراحات</span>
           </div>
