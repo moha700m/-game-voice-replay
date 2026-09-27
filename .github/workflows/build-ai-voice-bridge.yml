@@ -1,0 +1,55 @@
+name: Build AI Voice Bridge
+
+on:
+  push:
+    branches: ["ai-voice-bridge"]
+    paths:
+      - "ai-voice-bridge/**"
+      - ".github/workflows/build-ai-voice-bridge.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "ai-voice-bridge/**"
+      - ".github/workflows/build-ai-voice-bridge.yml"
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ai-voice-bridge
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: ai-voice-bridge/requirements.txt
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Syntax check
+        run: python -m py_compile app.py
+
+      - name: Build EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name AI-Voice-Bridge --collect-all sounddevice app.py
+
+      - name: Smoke-check artifact
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/AI-Voice-Bridge.exe")) { throw "EXE missing" }
+          $size = (Get-Item "dist/AI-Voice-Bridge.exe").Length
+          if ($size -lt 1000000) { throw "EXE unexpectedly small" }
+          Write-Host "EXE size: $size bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AI-Voice-Bridge-Windows
+          path: ai-voice-bridge/dist/AI-Voice-Bridge.exe
+          if-no-files-found: error
